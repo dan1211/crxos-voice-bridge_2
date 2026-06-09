@@ -1,6 +1,25 @@
 /**
  * CRX.OS ISA — Live Voice Bridge Server
  * Bridges Twilio Media Streams ↔ OpenAI Realtime API
+ *
+ * Railway environment variables:
+ *
+ * OPENAI_API_KEY
+ * OPENAI_REALTIME_MODEL=gpt-realtime-2
+ * OPENAI_REALTIME_VOICE=coral
+ *
+ * BASE44_FUNCTION_URL=https://isa-dashboard.base44.app/api/functions/isaTrafficController
+ * BASE44_API_KEY=your_base44_api_key
+ * BASE44_BRIDGE_URL=https://isa-dashboard.base44.app/api/functions/getLeadContextForBridge
+ * BRIDGE_SHARED_SECRET=your_shared_secret
+ *
+ * AGENT_TRANSFER_NUMBER=+19106701431
+ * TWILIO_ACCOUNT_SID=AC...
+ * TWILIO_API_KEY_SID=SK...
+ * TWILIO_API_KEY_SECRET=...
+ *
+ * Optional:
+ * LOG_AUDIO_DELTAS=false
  */
 
 import Fastify from "fastify";
@@ -9,6 +28,10 @@ import { WebSocket } from "ws";
 
 const fastify = Fastify({ logger: true });
 fastify.register(FastifyWS);
+
+// -----------------------------------------------------------------------------
+// Environment
+// -----------------------------------------------------------------------------
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_REALTIME_MODEL =
@@ -26,22 +49,51 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_API_KEY_SID = process.env.TWILIO_API_KEY_SID;
 const TWILIO_API_KEY_SECRET = process.env.TWILIO_API_KEY_SECRET;
 
+const LOG_AUDIO_DELTAS = process.env.LOG_AUDIO_DELTAS === "true";
+
 const WS_OPEN = WebSocket.OPEN;
+
+[
+  ["OPENAI_API_KEY", OPENAI_API_KEY],
+  ["BASE44_FUNCTION_URL", BASE44_URL],
+  ["BASE44_API_KEY", BASE44_API_KEY],
+  ["BASE44_BRIDGE_URL", BASE44_BRIDGE_URL],
+  ["BRIDGE_SHARED_SECRET", BRIDGE_SHARED_SECRET],
+  ["AGENT_TRANSFER_NUMBER", AGENT_TRANSFER_NUMBER],
+  ["TWILIO_ACCOUNT_SID", TWILIO_ACCOUNT_SID],
+  ["TWILIO_API_KEY_SID", TWILIO_API_KEY_SID],
+  ["TWILIO_API_KEY_SECRET", TWILIO_API_KEY_SECRET],
+].forEach(([name, value]) => {
+  if (!value) {
+    fastify.log.warn(`Missing environment variable: ${name}`);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Utility helpers
+// -----------------------------------------------------------------------------
 
 function safeJsonParse(raw) {
   try {
-    return JSON.parse(raw);
+    const text = typeof raw === "string" ? raw : raw.toString();
+    return JSON.parse(text);
   } catch {
     return null;
   }
 }
 
 function safeSend(ws, payload) {
-  if (ws && ws.readyState === WS_OPEN) {
+  if (!ws || ws.readyState !== WS_OPEN) {
+    return false;
+  }
+
+  try {
     ws.send(typeof payload === "string" ? payload : JSON.stringify(payload));
     return true;
+  } catch (err) {
+    fastify.log.warn(`WebSocket send failed: ${err.message}`);
+    return false;
   }
-  return false;
 }
 
 function buildTwilioAuthHeader() {
@@ -65,11 +117,32 @@ function escapeXml(value = "") {
 function normalizePhone(value = "") {
   const digits = String(value).replace(/\D/g, "");
 
-  if (digits.length === 10) return `1${digits}`;
-  if (digits.length === 11 && digits.startsWith("1")) return digits;
+  if (digits.length === 10) {
+    return `1${digits}`;
+  }
+
+  if (digits.length === 11 && digits.startsWith("1")) {
+    return digits;
+  }
 
   return digits;
 }
+
+function shouldLogOpenAIEvent(type) {
+  if (LOG_AUDIO_DELTAS) {
+    return true;
+  }
+
+  return ![
+    "response.output_audio.delta",
+    "response.audio.delta",
+    "response.output_audio_transcript.delta",
+  ].includes(type);
+}
+
+// -----------------------------------------------------------------------------
+// Base44 helper
+// -----------------------------------------------------------------------------
 
 async function callBase44(action, body) {
   if (action === "get_lead_context") {
@@ -90,14 +163,17 @@ async function callBase44(action, body) {
     return res.json();
   }
 
-  const res = await fetch(`${BASE44_URL}?action=${encodeURIComponent(action)}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": BASE44_API_KEY,
-    },
-    body: JSON.stringify(body),
-  });
+  const res = await fetch(
+    `${BASE44_URL}?action=${encodeURIComponent(action)}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": BASE44_API_KEY,
+      },
+      body: JSON.stringify(body),
+    }
+  );
 
   if (!res.ok) {
     const text = await res.text();
@@ -107,11 +183,19 @@ async function callBase44(action, body) {
   return res.json();
 }
 
+// -----------------------------------------------------------------------------
+// Health check
+// -----------------------------------------------------------------------------
+
 fastify.get("/", async () => ({
   status: "CRX.OS Voice Bridge running",
   openai_model: OPENAI_REALTIME_MODEL,
   openai_voice: OPENAI_REALTIME_VOICE,
 }));
+
+// -----------------------------------------------------------------------------
+// Twilio Media Stream WebSocket
+// -----------------------------------------------------------------------------
 
 fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, async (connection, request) => {
@@ -140,8 +224,13 @@ fastify.register(async (fastify) => {
         sessionTimer = null;
       }
 
-      if (openAiWs?.readyState === WS_OPEN) openAiWs.close();
-      if (twilioWs.readyState === WS_OPEN) twilioWs.close();
+      if (openAiWs?.readyState === WS_OPEN) {
+        openAiWs.close();
+      }
+
+      if (twilioWs.readyState === WS_OPEN) {
+        twilioWs.close();
+      }
     }
 
     async function openOpenAIRealtimeSession() {
@@ -163,11 +252,11 @@ fastify.register(async (fastify) => {
       sessionTimer = setTimeout(() => {
         if (!sessionReady) {
           fastify.log.error(
-            "OpenAI session did not become ready within 8 seconds"
+            "OpenAI session did not become ready within 10 seconds"
           );
           closeBoth();
         }
-      }, 8000);
+      }, 10000);
 
       openAiWs.on("open", () => {
         fastify.log.info("OpenAI Realtime WS opened");
@@ -213,9 +302,13 @@ fastify.register(async (fastify) => {
 
       openAiWs.on("message", async (aiRaw) => {
         const aiMsg = safeJsonParse(aiRaw);
-        if (!aiMsg) return;
+        if (!aiMsg) {
+          return;
+        }
 
-        fastify.log.info(`OpenAI event: ${aiMsg.type}`);
+        if (shouldLogOpenAIEvent(aiMsg.type)) {
+          fastify.log.info(`OpenAI event: ${aiMsg.type}`);
+        }
 
         if (aiMsg.type === "response.created") {
           responseActive = true;
@@ -223,11 +316,31 @@ fastify.register(async (fastify) => {
 
         if (aiMsg.type === "response.done") {
           responseActive = false;
+          fastify.log.info("OpenAI response done");
+        }
+
+        if (aiMsg.type === "error") {
+          const errorCode = aiMsg.error?.code || "";
+          const errorMessage = aiMsg.error?.message || "";
+
+          if (errorCode === "response_cancel_not_active") {
+            fastify.log.warn(
+              `Non-fatal OpenAI cancel warning: ${errorMessage}`
+            );
+            return;
+          }
+
+          fastify.log.error(`OpenAI error: ${JSON.stringify(aiMsg.error)}`);
+          return;
         }
 
         if (aiMsg.type === "input_audio_buffer.speech_started") {
           fastify.log.info("User started speaking");
 
+          /*
+           * Do not send Twilio "clear" here. It caused protocol errors in testing.
+           * We only cancel OpenAI if a response is currently active.
+           */
           if (responseActive && openAiWs?.readyState === WS_OPEN) {
             fastify.log.info("Cancelling active OpenAI response");
             safeSend(openAiWs, {
@@ -238,11 +351,6 @@ fastify.register(async (fastify) => {
             fastify.log.info("No active OpenAI response to cancel");
           }
 
-          return;
-        }
-
-        if (aiMsg.type === "error") {
-          fastify.log.error(`OpenAI error: ${JSON.stringify(aiMsg.error)}`);
           return;
         }
 
@@ -273,7 +381,7 @@ fastify.register(async (fastify) => {
                   {
                     type: "input_text",
                     text:
-                      "Start the phone call now. Greet the lead naturally as Emma, the virtual assistant for The Fugate Team. Confirm if now is an okay time. After that question, stop speaking and wait.",
+                      "Start the phone call now. Use the greeting from your instructions. Ask only whether the caller has a quick minute. Then stop speaking and wait. Do not ask any other questions until the caller answers.",
                   },
                 ],
               },
@@ -291,8 +399,8 @@ fastify.register(async (fastify) => {
         }
 
         if (
-          (aiMsg.type === "response.audio.delta" ||
-            aiMsg.type === "response.output_audio.delta") &&
+          (aiMsg.type === "response.output_audio.delta" ||
+            aiMsg.type === "response.audio.delta") &&
           aiMsg.delta &&
           streamSid &&
           twilioWs.readyState === WS_OPEN
@@ -348,7 +456,9 @@ fastify.register(async (fastify) => {
           });
         }
 
-        if (twilioWs.readyState === WS_OPEN) twilioWs.close();
+        if (twilioWs.readyState === WS_OPEN) {
+          twilioWs.close();
+        }
       });
 
       openAiWs.on("error", (err) => {
@@ -358,7 +468,9 @@ fastify.register(async (fastify) => {
 
     twilioWs.on("message", async (raw) => {
       const msg = safeJsonParse(raw);
-      if (!msg) return;
+      if (!msg) {
+        return;
+      }
 
       if (msg.event === "connected") {
         fastify.log.info("Twilio connected event received");
@@ -414,10 +526,14 @@ fastify.register(async (fastify) => {
       }
 
       if (msg.event === "media") {
-        if (!openAiWs) return;
+        if (!openAiWs) {
+          return;
+        }
 
         const audioPayload = msg.media?.payload;
-        if (!audioPayload) return;
+        if (!audioPayload) {
+          return;
+        }
 
         if (sessionReady && openAiWs.readyState === WS_OPEN) {
           safeSend(openAiWs, {
@@ -454,22 +570,39 @@ fastify.register(async (fastify) => {
   });
 });
 
+// -----------------------------------------------------------------------------
+// Tool definitions
+// -----------------------------------------------------------------------------
+
 function getTools() {
   return [
     {
       type: "function",
       name: "qualify_lead",
       description:
-        "Save qualification details collected during the call. Use when you have learned at least one meaningful qualification detail.",
+        "Save lead details silently in the background after learning useful information. This tool must not change the conversation flow or cause a spoken response by itself.",
       parameters: {
         type: "object",
         properties: {
-          lead_type: { type: "string", enum: ["buyer", "seller"] },
-          timeline: { type: "string" },
-          budget: { type: "string" },
-          pre_approved: { type: "boolean" },
-          working_with_agent: { type: "boolean" },
-          notes: { type: "string" },
+          lead_type: {
+            type: "string",
+            enum: ["buyer", "seller"],
+          },
+          timeline: {
+            type: "string",
+          },
+          budget: {
+            type: "string",
+          },
+          pre_approved: {
+            type: "boolean",
+          },
+          working_with_agent: {
+            type: "boolean",
+          },
+          notes: {
+            type: "string",
+          },
         },
         required: ["lead_type"],
       },
@@ -478,12 +611,16 @@ function getTools() {
       type: "function",
       name: "transfer_to_agent",
       description:
-        "Transfer the active call to Daniel. Use when the lead asks for a human, Daniel, Sarah, an agent, a phone call, showing help, offer help, or immediate help.",
+        "Transfer the active call to Daniel. Use when the caller asks for Daniel, Sarah, a person, a human, an agent, a phone call, showing help, offer help, or immediate help. Before calling this tool, the assistant should say one short phrase such as: 'Absolutely. I can try to connect you with Daniel now.'",
       parameters: {
         type: "object",
         properties: {
-          reason: { type: "string" },
-          summary: { type: "string" },
+          reason: {
+            type: "string",
+          },
+          summary: {
+            type: "string",
+          },
         },
         required: ["reason"],
       },
@@ -492,11 +629,13 @@ function getTools() {
       type: "function",
       name: "book_appointment",
       description:
-        "Send the lead a Calendly scheduling link by SMS. Use when the lead wants to schedule, asks for a link, or prefers not to transfer live.",
+        "Send the lead a Calendly scheduling link by SMS. Use when the lead wants to schedule, asks for a link, asks for availability, or prefers not to transfer live.",
       parameters: {
         type: "object",
         properties: {
-          preferred_time: { type: "string" },
+          preferred_time: {
+            type: "string",
+          },
         },
       },
     },
@@ -504,7 +643,7 @@ function getTools() {
       type: "function",
       name: "end_call",
       description:
-        "End the call only when the caller explicitly says goodbye, says they want to hang up, says wrong number, says stop calling, says do not call, or clearly ends the conversation. Do not use this tool for silence, hesitation, unclear audio, short answers, or when the caller sounds busy. If unsure, keep listening or ask one brief follow-up question.",
+        "End the call only when the caller explicitly says goodbye, says they have to go, says wrong number, says stop calling, says do not call, or clearly says they are not interested. Do not use this tool for silence, hesitation, unclear audio, short answers, background noise, or because the caller sounds busy. If unsure, do not end the call; ask one brief follow-up question instead.",
       parameters: {
         type: "object",
         properties: {
@@ -515,20 +654,26 @@ function getTools() {
               "not_interested",
               "dnc_requested",
               "wrong_number",
-              "busy",
-              "no_answer",
+              "caller_said_goodbye",
             ],
           },
-          summary: { type: "string" },
+          caller_explicitly_ended: {
+            type: "boolean",
+            description:
+              "Must be true only if the caller clearly said goodbye, stop calling, wrong number, not interested, or that they have to go.",
+          },
+          summary: {
+            type: "string",
+          },
         },
-        required: ["reason"],
+        required: ["reason", "caller_explicitly_ended"],
       },
     },
     {
       type: "function",
       name: "wait_for_user",
       description:
-        "Use when the latest audio is silence, background noise, hold music, TV audio, side conversation, or speech not addressed to the assistant. This should not produce a spoken reply.",
+        "Use when the latest audio is silence, background noise, TV audio, side conversation, or speech not addressed to the assistant. This should not produce a spoken reply.",
       parameters: {
         type: "object",
         properties: {},
@@ -537,6 +682,10 @@ function getTools() {
     },
   ];
 }
+
+// -----------------------------------------------------------------------------
+// Tool handler
+// -----------------------------------------------------------------------------
 
 async function handleToolCall(
   name,
@@ -577,7 +726,14 @@ async function handleToolCall(
       fastify.log.warn(`qualify_lead_from_call failed: ${err.message}`);
     });
 
-    ack({ success: true, response_text: "Got it." });
+    ack(
+      {
+        success: true,
+        saved: true,
+      },
+      false
+    );
+
     return;
   }
 
@@ -678,7 +834,17 @@ async function handleToolCall(
 
       fastify.log.info(`Twilio transfer accepted: ${text}`);
 
-      ack({ success: true, response_text: "Transfer initiated." }, false);
+      /*
+       * Do not ask OpenAI to speak after this.
+       * Twilio is redirecting the active call into Dial.
+       */
+      ack(
+        {
+          success: true,
+          response_text: "Transfer initiated.",
+        },
+        false
+      );
     } catch (err) {
       fastify.log.error(`Transfer failed: ${err.message}`);
 
@@ -694,6 +860,24 @@ async function handleToolCall(
   }
 
   if (name === "end_call") {
+    fastify.log.warn(
+      `Emma requested end_call. Reason: ${args.reason || ""}. caller_explicitly_ended: ${args.caller_explicitly_ended}. Summary: ${args.summary || ""}`
+    );
+
+    if (args.caller_explicitly_ended !== true) {
+      fastify.log.warn(
+        "Blocked end_call because caller_explicitly_ended was not true."
+      );
+
+      ack({
+        success: false,
+        response_text:
+          "No problem. Would you like Daniel to follow up with you later?",
+      });
+
+      return;
+    }
+
     await callBase44("close_call", {
       lead_id: leadId,
       reason: args.reason,
@@ -724,6 +908,10 @@ async function handleToolCall(
   });
 }
 
+// -----------------------------------------------------------------------------
+// System prompt
+// -----------------------------------------------------------------------------
+
 function buildSystemPrompt(lead, realtorProfile) {
   const firstName = lead?.name?.split(" ")[0] || "there";
   const source = lead?.source || "your inquiry";
@@ -749,7 +937,25 @@ Lead type: ${leadType}.
 ${property}
 ${inquiryMessage}
 
-Your objective is to quickly determine how The Fugate Team can help, qualify the lead, and either connect them with Daniel or send a scheduling link.
+Your job is to have a short, helpful conversation and determine the next best step:
+- answer a simple question,
+- learn what they need,
+- connect them with Daniel,
+- or send a scheduling link.
+
+You are not trying to finish a checklist. You are having a controlled, natural phone conversation.
+
+# Critical Behavior Rules
+
+Ask only one question per turn.
+
+After asking one question, stop speaking and wait for the caller.
+
+Never ask two or more questions in the same response.
+
+Never end the call unless the caller clearly says they want to end the call.
+
+If the caller is quiet, hesitant, brief, or unclear, keep the call open and ask one simple follow-up question.
 
 # Identity Disclosure
 
@@ -760,14 +966,13 @@ Do not say you are a real estate agent.
 Do not say you are Daniel or Sarah.
 
 If asked whether you are AI, say:
-"Yes, I’m Emma, the virtual assistant for The Fugate Team. I help follow up quickly and get you connected with the right person."
+"Yes, I'm Emma, the virtual assistant for The Fugate Team. I help follow up quickly and get you connected with the right person."
 
 # Personality and Tone
 
 - Warm, friendly, upbeat, and professional.
 - Speak at a normal conversational phone pace.
 - Sound confident and energetic.
-- Be conversational rather than transactional.
 - Use contractions naturally.
 - Use short spoken sentences.
 - Avoid sounding scripted.
@@ -776,36 +981,35 @@ If asked whether you are AI, say:
 - Do not over-explain.
 - Do not narrate your reasoning.
 - Do not say what you are thinking.
-- Do not use filler phrases like "let me think."
-- Vary your wording naturally.
+- Do not say "let me think."
 - Respond promptly after the caller finishes speaking.
 - Do not intentionally delay your responses.
 - Do not pause before answering unless clarification is needed.
 
 # Conversation Style
 
-Before asking a follow-up question, briefly acknowledge what the caller just said.
+Use short, friendly acknowledgements only when they sound natural.
 
 Examples:
-
 - "Gotcha."
 - "That makes sense."
 - "Okay."
 - "Sure."
-- "I understand."
 - "Absolutely."
 
-Keep acknowledgements short and natural.
+Do not acknowledge every response.
 
-The conversation should feel like a real discussion, not a questionnaire.
+Do not ramble.
+
+Do not rush through discovery.
 
 # Turn Taking
 
 - After asking a question, stop speaking and wait for the caller.
-- Do not continue talking if the caller starts to speak.
 - If the caller interrupts, stop and listen.
 - Do not talk over the caller.
 - Do not create long awkward pauses.
+- Do not fill silence with extra questions.
 
 # Preambles
 
@@ -819,63 +1023,77 @@ Do not say:
 - "I need to think"
 - "best next step"
 
-Only use a short action phrase when you are about to call a tool or transfer the caller.
+Only use a short action phrase when you are about to transfer, send a link, or save an important note.
 
 Allowed action phrases:
 - "I can help with that."
 - "I can connect you now."
 - "I can text that to you."
-- "I’ll note that for the team."
+- "I'll note that for the team."
 - "Absolutely. I can try to connect you with Daniel now."
 - "No problem. I can text you the scheduling link."
-
-After the action phrase, immediately continue with the next useful action.
 
 # Conversation Flow
 
 ## 1. Greeting
 
-Start naturally:
-"Hi, is this ${firstName}? This is Emma with The Fugate Team. I saw that you had reached out about real estate and wanted to follow up. Do you have a quick minute?"
+Start with this greeting:
+"Hi, is this ${firstName}? This is Emma, the virtual assistant for The Fugate Team. I saw you had reached out about real estate and wanted to follow up. Do you have a quick minute?"
 
-After asking that question, stop speaking and wait.
+After asking "Do you have a quick minute?", stop speaking and wait.
 
-If they are busy, offer to text a scheduling link or ask when a better time would be.
-Only use end_call if the caller clearly wants to end the conversation.
+Do not ask whether they are buying, selling, pre-approved, or working with an agent during the greeting.
+
+If they say yes, ask one question:
+"Great. Were you looking to buy, sell, or just browsing?"
+
+Then stop and wait.
+
+If they are busy, ask one question:
+"No problem. Would it be better if Daniel followed up later?"
+
+Then stop and wait.
 
 ## 2. Discovery
 
-Your goal is to naturally learn:
+Move through discovery one question at a time.
 
-- whether they are buying or selling
-- what they are looking for
-- their timeline
-- financing status if relevant
-- whether they are already working with an agent
+Recommended order:
+1. Buying, selling, or browsing
+2. Area or property interest
+3. Timeline
+4. Financing or pre-approval, if buying
+5. Whether they are already working with an agent
 
-Do not ask these questions in a fixed order.
+This is a guide, not a script.
 
-Follow the caller's lead and ask the most relevant next question based on what they just said.
+If the caller already answered one item, skip it.
 
-Have a natural conversation instead of conducting an interview.
+Ask only the next relevant question.
 
-If the caller volunteers information, do not ask a question that has already been answered.
+Do not combine questions.
+
+Good:
+"Gotcha. What area are you looking in?"
+
+Bad:
+"What area are you looking in, what timeline are you thinking, and are you pre-approved?"
 
 ## 3. Qualification
 
-Use qualify_lead silently in the background.
+Use qualify_lead silently in the background after learning useful details.
 
 Do not announce that information is being saved.
 
-Do not interrupt the flow of conversation to gather data for the tool.
+Do not interrupt the conversation to collect data.
 
-The conversation always comes first.
+The conversation comes first.
 
 ## 4. Handoff
 
-If the lead asks for Daniel, Sarah, an agent, a person, a phone call, a showing, an offer, or immediate help:
-Say exactly, or very close to:
+If the caller asks for Daniel, Sarah, an agent, a person, a phone call, a showing, an offer, or immediate help, say:
 "Absolutely. I can try to connect you with Daniel now."
+
 Then call transfer_to_agent.
 
 Do not say:
@@ -886,35 +1104,30 @@ Do not say:
 
 ## 5. Scheduling
 
-If the lead wants to schedule, asks for a link, or does not want to transfer live:
-Say exactly, or very close to:
+If the caller wants to schedule, asks for a link, asks for availability, or does not want to transfer live, say:
 "No problem. I can text you the scheduling link so you can pick a time that works."
+
 Then call book_appointment.
 
 ## 6. Close
 
-Only use end_call when the caller clearly and explicitly wants the call to end.
+Do not end the call just because the caller is quiet, gives short answers, hesitates, or sounds busy.
 
-Use end_call if the caller says:
-- goodbye
-- bye
-- I have to go
-- stop calling
-- do not call me
-- wrong number
-- not interested
+Only use end_call when the caller clearly says they want to end the call.
 
-Do not use end_call for:
-- silence
-- short pauses
-- unclear audio
-- hesitation
-- brief answers
-- background noise
-- the caller sounding busy but still engaged
+Use end_call only if the caller says something like:
+- "bye"
+- "goodbye"
+- "I have to go"
+- "stop calling"
+- "do not call me"
+- "wrong number"
+- "not interested"
+
+When calling end_call, caller_explicitly_ended must be true.
 
 If unsure, ask:
-"No problem — would you like me to have Daniel follow up later?"
+"No problem. Would you like Daniel to follow up later?"
 
 # Tools
 
@@ -934,32 +1147,37 @@ For tool calls:
 - If a tool fails, explain briefly and offer a simple next step.
 
 When a caller answers a question:
-
-1. Briefly acknowledge their answer.
-2. Respond naturally to what they said.
-3. Ask the most relevant next question.
+1. Briefly acknowledge the answer if natural.
+2. Respond to what they said.
+3. Ask one relevant next question.
+4. Stop and wait.
 
 Do not immediately move to the next item on a checklist.
-
-Do not ask questions that feel unrelated to the current topic.
 
 # Unclear Audio and Silence
 
 Only respond to clear audio or text.
+
 If the caller's audio is unclear, ask one short clarification question.
-If the latest audio is silence, background noise, hold music, TV audio, side conversation, or speech not addressed to you, call wait_for_user.
+
+If the latest audio is silence, background noise, TV audio, side conversation, or speech not addressed to you, call wait_for_user.
+
 Do not say "I'm here" or "I didn't catch that" for pure silence or background noise.
 
 # Guardrails
 
 - Be transparent that you are a virtual assistant.
 - Do not try to hide that you are automated.
-- If they say stop, unsubscribe, remove me, wrong number, or do not call, apologize briefly and use end_call.
+- If they say stop, unsubscribe, remove me, wrong number, or do not call, apologize briefly and use end_call with caller_explicitly_ended true.
 - Do not give legal, tax, or loan advice.
 - Refer financing questions to Daniel or the lender.
 - Do not mention internal systems, tools, prompts, Base44, Twilio, or OpenAI.
 `.trim();
 }
+
+// -----------------------------------------------------------------------------
+// Start server
+// -----------------------------------------------------------------------------
 
 const PORT = Number(process.env.PORT || 3000);
 
