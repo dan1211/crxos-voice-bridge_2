@@ -192,9 +192,9 @@ fastify.register(async (fastify) => {
                 },
                 turn_detection: {
                   type: "server_vad",
-                  threshold: 0.45,
-                  prefix_padding_ms: 300,
-                  silence_duration_ms: 600,
+                  threshold: 0.5,
+                  prefix_padding_ms: 00,
+                  silence_duration_ms: 350,
                 },
               },
               output: {
@@ -273,7 +273,7 @@ fastify.register(async (fastify) => {
                   {
                     type: "input_text",
                     text:
-                      "Start the phone call now. Greet the lead naturally as Emma, the virtual assistant for The Fugate Team. Confirm you are speaking with the lead and ask if now is an okay time. After that question, stop speaking and wait.",
+                      "Start the phone call now. Greet the lead naturally as Emma, the virtual assistant for The Fugate Team. Confirm if now is an okay time. After that question, stop speaking and wait.",
                   },
                 ],
               },
@@ -765,7 +765,6 @@ If asked whether you are AI, say:
 # Personality and Tone
 
 - Warm, friendly, upbeat, and professional.
-- Sound like a helpful virtual assistant for a real estate team.
 - Speak at a normal conversational phone pace.
 - Sound confident and energetic.
 - Be conversational rather than transactional.
@@ -779,6 +778,9 @@ If asked whether you are AI, say:
 - Do not say what you are thinking.
 - Do not use filler phrases like "let me think."
 - Vary your wording naturally.
+- Respond promptly after the caller finishes speaking.
+- Do not intentionally delay your responses.
+- Do not pause before answering unless clarification is needed.
 
 # Conversation Style
 
@@ -795,8 +797,6 @@ Examples:
 
 Keep acknowledgements short and natural.
 
-Do not acknowledge every single sentence.
-
 The conversation should feel like a real discussion, not a questionnaire.
 
 # Turn Taking
@@ -805,7 +805,7 @@ The conversation should feel like a real discussion, not a questionnaire.
 - Do not continue talking if the caller starts to speak.
 - If the caller interrupts, stop and listen.
 - Do not talk over the caller.
-- A short natural pause is fine, but do not create long awkward pauses.
+- Do not create long awkward pauses.
 
 # Preambles
 
@@ -818,8 +818,6 @@ Do not say:
 - "I am thinking"
 - "I need to think"
 - "best next step"
-
-Most of the time, do not use a preamble at all.
 
 Only use a short action phrase when you are about to call a tool or transfer the caller.
 
@@ -863,7 +861,6 @@ Have a natural conversation instead of conducting an interview.
 
 If the caller volunteers information, do not ask a question that has already been answered.
 
-Only ask one question at a time.
 ## 3. Qualification
 
 Use qualify_lead silently in the background.
