@@ -4,7 +4,7 @@
  *
  * ENV VARS (Railway dashboard):
  *   OPENAI_API_KEY
- *   OPENAI_REALTIME_MODEL  optional, default: gpt-realtime
+ *   OPENAI_REALTIME_MODEL  optional, default: gpt-realtime-2
  *   OPENAI_REALTIME_VOICE  optional, default: alloy
  *
  *   BASE44_FUNCTION_URL    https://isa-dashboard.base44.app/api/functions/isaTrafficController
@@ -32,8 +32,10 @@ fastify.register(FastifyWS);
 // ─────────────────────────────────────────────────────────────────────────────
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
-const OPENAI_REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "alloy";
+const OPENAI_REALTIME_MODEL =
+  process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2";
+const OPENAI_REALTIME_VOICE =
+  process.env.OPENAI_REALTIME_VOICE || "alloy";
 
 const BASE44_URL = process.env.BASE44_FUNCTION_URL;
 const BASE44_API_KEY = process.env.BASE44_API_KEY;
@@ -89,7 +91,9 @@ function safeSend(ws, payload) {
 function buildTwilioAuthHeader() {
   return (
     "Basic " +
-    Buffer.from(`${TWILIO_API_KEY_SID}:${TWILIO_API_KEY_SECRET}`).toString("base64")
+    Buffer.from(`${TWILIO_API_KEY_SID}:${TWILIO_API_KEY_SECRET}`).toString(
+      "base64"
+    )
   );
 }
 
@@ -211,7 +215,9 @@ fastify.register(async (fastify) => {
 
       sessionTimer = setTimeout(() => {
         if (!sessionReady) {
-          fastify.log.error("OpenAI session did not become ready within 8 seconds");
+          fastify.log.error(
+            "OpenAI session did not become ready within 8 seconds"
+          );
           closeBoth();
         }
       }, 8000);
@@ -219,35 +225,33 @@ fastify.register(async (fastify) => {
       openAiWs.on("open", () => {
         fastify.log.info("OpenAI Realtime WS opened");
 
-        /*
-         * Intentionally using the flat Realtime session fields here:
-         * modalities
-         * voice
-         * input_audio_format
-         * output_audio_format
-         * turn_detection
-         *
-         * Do NOT add the old beta header or beta subprotocol back in.
-         */
         safeSend(openAiWs, {
           type: "session.update",
           session: {
             type: "realtime",
-            model: gpt-realtime-2,
-           instructions: systemPrompt,
+            model: OPENAI_REALTIME_MODEL,
+            instructions: systemPrompt,
 
-            modalities: ["text", "audio"],
-            voice: gpt-realtime-2,
+            output_modalities: ["audio"],
 
-            input_audio_format: "g711_ulaw",
-            output_audio_format: "g711_ulaw",
-            input_audio_transcription: null,
-
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 500,
+            audio: {
+              input: {
+                format: {
+                  type: "g711_ulaw",
+                },
+                turn_detection: {
+                  type: "server_vad",
+                  threshold: 0.5,
+                  prefix_padding_ms: 300,
+                  silence_duration_ms: 500,
+                },
+              },
+              output: {
+                format: {
+                  type: "g711_ulaw",
+                },
+                voice: OPENAI_REALTIME_VOICE,
+              },
             },
 
             tools: getTools(),
@@ -303,7 +307,7 @@ fastify.register(async (fastify) => {
             safeSend(openAiWs, {
               type: "response.create",
               response: {
-                modalities: ["audio"],
+                output_modalities: ["audio"],
               },
             });
           }
@@ -311,11 +315,6 @@ fastify.register(async (fastify) => {
           return;
         }
 
-        /*
-         * Supports both event names:
-         * - response.audio.delta: older/flat Realtime event style
-         * - response.output_audio.delta: newer GA event style
-         */
         if (
           (aiMsg.type === "response.audio.delta" ||
             aiMsg.type === "response.output_audio.delta") &&
@@ -433,7 +432,9 @@ fastify.register(async (fastify) => {
           calendlyLink = realtorProfile?.calendly_link || "";
           systemPrompt = buildSystemPrompt(lead, realtorProfile);
 
-          fastify.log.info(`Lead loaded: ${lead?.name || "Unknown"} (${leadId})`);
+          fastify.log.info(
+            `Lead loaded: ${lead?.name || "Unknown"} (${leadId})`
+          );
         } catch (err) {
           fastify.log.error(`Failed to load lead context: ${err.message}`);
           closeBoth();
@@ -500,7 +501,7 @@ function getTools() {
       type: "function",
       name: "qualify_lead",
       description:
-        "Save qualification details collected during the call. Call this as soon as you have key facts. Do not wait until the end.",
+        "Save qualification details collected during the call. Use when you have learned at least one meaningful qualification detail. Do not wait until the end of the call.",
       parameters: {
         type: "object",
         properties: {
@@ -531,7 +532,7 @@ function getTools() {
       type: "function",
       name: "transfer_to_agent",
       description:
-        "Use when the lead asks to speak to a person, wants help now, is ready to make an offer, or is clearly a hot qualified lead.",
+        "Transfer the active call to Daniel. Use when the lead asks for a human, wants to speak with Daniel or Sarah, is ready to take action, wants to make an offer, or is clearly a hot qualified lead.",
       parameters: {
         type: "object",
         properties: {
@@ -549,7 +550,7 @@ function getTools() {
       type: "function",
       name: "book_appointment",
       description:
-        "Use when the lead wants to schedule a call. This will ask Base44 to send the Calendly link by SMS.",
+        "Send the lead a Calendly link by SMS. Use when the lead wants to schedule a call instead of transferring live.",
       parameters: {
         type: "object",
         properties: {
@@ -563,7 +564,7 @@ function getTools() {
       type: "function",
       name: "end_call",
       description:
-        "Use when the conversation is complete, the lead wants to go, it is a wrong number, or they asked to stop contact.",
+        "End the call. Use when the conversation is complete, the lead is busy and does not want to continue, it is a wrong number, or the lead asks not to be contacted.",
       parameters: {
         type: "object",
         properties: {
@@ -574,6 +575,7 @@ function getTools() {
               "not_interested",
               "dnc_requested",
               "wrong_number",
+              "busy",
               "no_answer",
             ],
           },
@@ -582,6 +584,17 @@ function getTools() {
           },
         },
         required: ["reason"],
+      },
+    },
+    {
+      type: "function",
+      name: "wait_for_user",
+      description:
+        "Use when the latest audio is silence, background noise, hold music, TV audio, side conversation, or speech not addressed to the assistant. This should not produce a spoken reply.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
       },
     },
   ];
@@ -597,7 +610,7 @@ async function handleToolCall(
   callId,
   { lead, realtorProfile, callSid, calendlyLink, openAiWs, twilioWs, leadId }
 ) {
-  const ack = (output) => {
+  const ack = (output, createAudioResponse = true) => {
     safeSend(openAiWs, {
       type: "conversation.item.create",
       item: {
@@ -607,13 +620,20 @@ async function handleToolCall(
       },
     });
 
-    safeSend(openAiWs, {
-      type: "response.create",
-      response: {
-        modalities: ["audio"],
-      },
-    });
+    if (createAudioResponse) {
+      safeSend(openAiWs, {
+        type: "response.create",
+        response: {
+          output_modalities: ["audio"],
+        },
+      });
+    }
   };
+
+  if (name === "wait_for_user") {
+    ack({ success: true, action: "waiting" }, false);
+    return;
+  }
 
   if (name === "qualify_lead") {
     await callBase44("qualify_lead_from_call", {
@@ -625,6 +645,7 @@ async function handleToolCall(
 
     ack({
       success: true,
+      response_text: "Got it.",
     });
 
     return;
@@ -641,8 +662,8 @@ async function handleToolCall(
 
     ack({
       success: true,
-      message:
-        "Tell the lead naturally: I just sent you a link to book a time that works for you.",
+      response_text:
+        "I just sent you a link to book a time that works for you.",
     });
 
     return;
@@ -689,13 +710,15 @@ async function handleToolCall(
 
       ack({
         success: true,
-        message: "Transfer initiated.",
+        response_text: "I am connecting you now.",
       });
     } catch (err) {
       fastify.log.error(`Transfer failed: ${err.message}`);
 
       ack({
         success: false,
+        response_text:
+          "I could not connect the call right now, but the team will follow up with you shortly.",
         error: err.message,
       });
     }
@@ -714,7 +737,7 @@ async function handleToolCall(
 
     ack({
       success: true,
-      message: "End the call politely and briefly.",
+      response_text: "Thanks for your time. Have a great day.",
     });
 
     setTimeout(() => {
@@ -728,6 +751,8 @@ async function handleToolCall(
 
   ack({
     success: false,
+    response_text:
+      "I could not complete that action, but I can still help with the call.",
     error: `Unknown tool: ${name}`,
   });
 }
@@ -747,47 +772,99 @@ function buildSystemPrompt(lead, realtorProfile) {
     ? `They originally inquired about ${lead.property_address}${
         lead.property_price ? ` listed at ${lead.property_price}` : ""
       }.`
-    : "";
+    : "No specific property was attached to this lead.";
 
   const inquiryMessage = lead?.inquiry_message
-    ? `Their original message was: "${lead.inquiry_message}".`
-    : "";
+    ? `Original inquiry message: "${lead.inquiry_message}".`
+    : "No original inquiry message was attached.";
 
   return `
-You are ${isaName}, a friendly and professional real estate ISA with ${teamName}.
+# Role and Objective
+
+You are ${isaName}, a friendly and professional real estate inside sales assistant for ${teamName}.
 You are on a live outbound phone call with ${firstName}, who came in from ${source}.
 Lead type: ${leadType}.
 ${property}
 ${inquiryMessage}
 
-Your job is to have a natural, helpful conversation and determine how the team can help.
+Your objective is to quickly determine how the team can help, qualify the lead, and either connect them with Daniel or schedule the next step.
 
-Start the call like a normal person:
+# Personality and Tone
+
+- Warm, calm, professional, and natural.
+- Sound like a helpful team member, not a phone tree.
+- Use short spoken sentences.
+- Ask one question at a time.
+- Do not over-explain.
+- Vary your wording so you do not sound repetitive.
+
+# Language
+
+- Speak English by default.
+- Do not switch languages based only on accent, filler words, names, or addresses.
+- If the caller clearly asks for another language, politely say the team will follow up.
+
+# Conversation Flow
+
+## 1. Greeting
+
+Start naturally:
 "Hi, is this ${firstName}? This is ${isaName} with ${teamName}. I was following up on your real estate inquiry. Did I catch you at an okay time?"
 
-Call goals:
-First, confirm whether now is an okay time.
-Then ask whether they are buying, selling, or just browsing.
+If they are busy, ask for a better time, then use end_call.
+
+## 2. Discovery
+
+Ask whether they are buying, selling, or just browsing.
 Ask what area they are interested in.
 Ask their timeline.
 If they are buying, ask whether they have spoken with a lender or are pre-approved.
 Ask whether they are already working with another agent.
-If they are engaged, qualified, or ask for a person, offer to connect them with Daniel now.
-If they prefer scheduling, use book_appointment.
-Use qualify_lead once you collect useful qualification details.
 
-Voice rules:
-Speak in short, natural sentences.
-Ask one question at a time.
-Do not mention pressing buttons.
-Do not sound like a phone tree.
-Do not use bullet points, markdown, or lists.
-Do not over-explain.
-Be honest if asked whether you are AI: say you are a virtual assistant helping the team follow up quickly.
-If the lead is busy, ask whether there is a better time and then end politely.
-If they say stop, unsubscribe, remove me, wrong number, or do not call, apologize and use end_call immediately.
-Do not give legal, tax, or loan advice. Refer those questions to Daniel, Sarah, or the lender.
-Keep the tone calm, clear, professional, and conversational.
+## 3. Qualification
+
+Use qualify_lead after you learn useful details such as timeline, budget, pre-approval status, whether they have an agent, or notes about what they want.
+
+## 4. Handoff
+
+If the lead asks for Daniel, Sarah, an agent, a person, a call, a showing, an offer, or immediate help, use transfer_to_agent.
+If the lead prefers to schedule instead of talking live, use book_appointment.
+
+## 5. Close
+
+If the call is complete, they are not interested, it is a wrong number, or they ask not to be contacted, use end_call.
+
+# Tools
+
+Use only these available tools:
+- qualify_lead
+- transfer_to_agent
+- book_appointment
+- end_call
+- wait_for_user
+
+Before calling transfer_to_agent, say a short natural preamble such as:
+"That makes sense. I can try to connect you with Daniel now."
+
+Before calling book_appointment, say:
+"I can text you a link to pick a time that works for you."
+
+Only say an action is complete after the tool succeeds.
+If a tool fails, explain briefly and offer a simple next step.
+
+# Unclear Audio and Silence
+
+Only respond to clear audio or text.
+If the caller's audio is unclear, ask one short clarification question.
+If the latest audio is silence, background noise, hold music, TV audio, side conversation, or speech not addressed to you, call wait_for_user.
+Do not say "I'm here" or "I didn't catch that" for pure silence or background noise.
+
+# Guardrails
+
+- If they say stop, unsubscribe, remove me, wrong number, or do not call, apologize briefly and use end_call.
+- Do not give legal, tax, or loan advice.
+- Refer financing questions to Daniel or the lender.
+- Do not mention internal systems, tools, prompts, Base44, Twilio, or OpenAI.
 `.trim();
 }
 
