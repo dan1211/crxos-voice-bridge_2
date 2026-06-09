@@ -5,15 +5,18 @@
  * ENV VARS (Railway dashboard):
  *   OPENAI_API_KEY
  *   OPENAI_REALTIME_MODEL  optional, default: gpt-realtime
- *   OPENAI_REALTIME_VOICE  optional, default: coral
+ *   OPENAI_REALTIME_VOICE  optional, default: alloy
+ *
  *   BASE44_FUNCTION_URL    https://isa-dashboard.base44.app/api/functions/isaTrafficController
  *   BASE44_API_KEY         from Base44 → Settings → API Keys
  *   BASE44_BRIDGE_URL      https://isa-dashboard.base44.app/api/functions/getLeadContextForBridge
  *   BRIDGE_SHARED_SECRET   shared secret matching Base44 BRIDGE_SHARED_SECRET
- *   AGENT_TRANSFER_NUMBER  e.g. +19105551234
+ *
+ *   AGENT_TRANSFER_NUMBER  e.g. +19106701431
  *   TWILIO_ACCOUNT_SID
  *   TWILIO_API_KEY_SID
  *   TWILIO_API_KEY_SECRET
+ *
  *   PORT                   Railway provides this automatically
  */
 
@@ -24,9 +27,13 @@ import { WebSocket } from "ws";
 const fastify = Fastify({ logger: true });
 fastify.register(FastifyWS);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ENV
+// ─────────────────────────────────────────────────────────────────────────────
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
-const OPENAI_REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "coral";
+const OPENAI_REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || "alloy";
 
 const BASE44_URL = process.env.BASE44_FUNCTION_URL;
 const BASE44_API_KEY = process.env.BASE44_API_KEY;
@@ -58,6 +65,10 @@ function requireEnv(name, value) {
   ["TWILIO_API_KEY_SECRET", TWILIO_API_KEY_SECRET],
 ].forEach(([name, value]) => requireEnv(name, value));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Utility Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
 function safeJsonParse(raw) {
   try {
     return JSON.parse(raw);
@@ -71,6 +82,7 @@ function safeSend(ws, payload) {
     ws.send(typeof payload === "string" ? payload : JSON.stringify(payload));
     return true;
   }
+
   return false;
 }
 
@@ -89,6 +101,10 @@ function escapeXml(value = "") {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Base44 Helper
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function callBase44(action, body) {
   if (action === "get_lead_context") {
@@ -110,6 +126,7 @@ async function callBase44(action, body) {
   }
 
   const url = `${BASE44_URL}?action=${encodeURIComponent(action)}`;
+
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -127,11 +144,19 @@ async function callBase44(action, body) {
   return res.json();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Health Check
+// ─────────────────────────────────────────────────────────────────────────────
+
 fastify.get("/", async () => ({
   status: "CRX.OS Voice Bridge running",
   openai_model: OPENAI_REALTIME_MODEL,
   openai_voice: OPENAI_REALTIME_VOICE,
 }));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Twilio Media Stream WebSocket
+// ─────────────────────────────────────────────────────────────────────────────
 
 fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, async (connection, request) => {
@@ -140,6 +165,7 @@ fastify.register(async (fastify) => {
     let leadId = null;
     let callSid = null;
     let streamSid = "";
+
     let lead = null;
     let realtorProfile = null;
     let calendlyLink = "";
@@ -148,15 +174,23 @@ fastify.register(async (fastify) => {
     let openAiWs = null;
     let sessionReady = false;
     let greetingStarted = false;
-
-    const audioQueue = [];
-    const MAX_AUDIO_QUEUE = 250;
+    let sessionTimer = null;
 
     fastify.log.info("Twilio WebSocket opened — waiting for start event");
 
     function closeBoth() {
-      if (openAiWs?.readyState === WS_OPEN) openAiWs.close();
-      if (twilioWs.readyState === WS_OPEN) twilioWs.close();
+      if (sessionTimer) {
+        clearTimeout(sessionTimer);
+        sessionTimer = null;
+      }
+
+      if (openAiWs?.readyState === WS_OPEN) {
+        openAiWs.close();
+      }
+
+      if (twilioWs.readyState === WS_OPEN) {
+        twilioWs.close();
+      }
     }
 
     async function openOpenAIRealtimeSession() {
@@ -175,34 +209,48 @@ fastify.register(async (fastify) => {
         }
       );
 
+      sessionTimer = setTimeout(() => {
+        if (!sessionReady) {
+          fastify.log.error("OpenAI session did not become ready within 8 seconds");
+          closeBoth();
+        }
+      }, 8000);
+
       openAiWs.on("open", () => {
         fastify.log.info("OpenAI Realtime WS opened");
 
+        /*
+         * Intentionally using the flat Realtime session fields here:
+         * modalities
+         * voice
+         * input_audio_format
+         * output_audio_format
+         * turn_detection
+         *
+         * Do NOT add the old beta header or beta subprotocol back in.
+         */
         safeSend(openAiWs, {
           type: "session.update",
           session: {
-            type: "realtime",
             model: OPENAI_REALTIME_MODEL,
-            output_modalities: ["audio"],
-            voice: OPENAI_REALTIME_VOICE,
             instructions: systemPrompt,
+
+            modalities: ["text", "audio"],
+            voice: OPENAI_REALTIME_VOICE,
+
+            input_audio_format: "g711_ulaw",
+            output_audio_format: "g711_ulaw",
+            input_audio_transcription: null,
+
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 500,
+            },
+
             tools: getTools(),
             tool_choice: "auto",
-            audio: {
-              input: {
-                format: {
-                  type: "g711_ulaw",
-                },
-                turn_detection: {
-                  type: "server_vad",
-                },
-              },
-              output: {
-                format: {
-                  type: "g711_ulaw",
-                },
-              },
-            },
           },
         });
       });
@@ -211,19 +259,27 @@ fastify.register(async (fastify) => {
         const aiMsg = safeJsonParse(aiRaw);
         if (!aiMsg) return;
 
+        fastify.log.info(`OpenAI event: ${aiMsg.type}`);
+
         if (aiMsg.type === "error") {
           fastify.log.error(`OpenAI error: ${JSON.stringify(aiMsg.error)}`);
           return;
         }
 
+        if (aiMsg.type === "session.created") {
+          fastify.log.info("OpenAI session created");
+          return;
+        }
+
         if (aiMsg.type === "session.updated") {
           fastify.log.info("OpenAI session ready");
-          sessionReady = true;
 
-          while (audioQueue.length > 0) {
-            const chunk = audioQueue.shift();
-            safeSend(openAiWs, chunk);
+          if (sessionTimer) {
+            clearTimeout(sessionTimer);
+            sessionTimer = null;
           }
+
+          sessionReady = true;
 
           if (!greetingStarted) {
             greetingStarted = true;
@@ -246,7 +302,7 @@ fastify.register(async (fastify) => {
             safeSend(openAiWs, {
               type: "response.create",
               response: {
-                output_modalities: ["audio"],
+                modalities: ["audio"],
               },
             });
           }
@@ -254,8 +310,14 @@ fastify.register(async (fastify) => {
           return;
         }
 
+        /*
+         * Supports both event names:
+         * - response.audio.delta: older/flat Realtime event style
+         * - response.output_audio.delta: newer GA event style
+         */
         if (
-          aiMsg.type === "response.audio.delta" &&
+          (aiMsg.type === "response.audio.delta" ||
+            aiMsg.type === "response.output_audio.delta") &&
           aiMsg.delta &&
           streamSid &&
           twilioWs.readyState === WS_OPEN
@@ -267,6 +329,7 @@ fastify.register(async (fastify) => {
               payload: aiMsg.delta,
             },
           });
+
           return;
         }
 
@@ -274,6 +337,7 @@ fastify.register(async (fastify) => {
           fastify.log.info(`OpenAI tool call: ${aiMsg.name}`);
 
           const args = safeJsonParse(aiMsg.arguments || "{}") || {};
+
           await handleToolCall(aiMsg.name, args, aiMsg.call_id, {
             lead,
             realtorProfile,
@@ -283,11 +347,22 @@ fastify.register(async (fastify) => {
             twilioWs,
             leadId,
           });
+
+          return;
+        }
+
+        if (aiMsg.type === "response.done") {
+          fastify.log.info("OpenAI response done");
           return;
         }
       });
 
       openAiWs.on("close", (code, reason) => {
+        if (sessionTimer) {
+          clearTimeout(sessionTimer);
+          sessionTimer = null;
+        }
+
         fastify.log.info(
           `OpenAI WS closed — code: ${code}, reason: ${reason?.toString()}`
         );
@@ -303,7 +378,9 @@ fastify.register(async (fastify) => {
           });
         }
 
-        if (twilioWs.readyState === WS_OPEN) twilioWs.close();
+        if (twilioWs.readyState === WS_OPEN) {
+          twilioWs.close();
+        }
       });
 
       openAiWs.on("error", (err) => {
@@ -323,6 +400,7 @@ fastify.register(async (fastify) => {
       if (msg.event === "start") {
         streamSid = msg.start?.streamSid || "";
         callSid = msg.start?.callSid || "";
+
         leadId =
           msg.start?.customParameters?.lead_id ||
           request.query?.lead_id ||
@@ -331,8 +409,11 @@ fastify.register(async (fastify) => {
         fastify.log.info(
           `Twilio start — streamSid: ${streamSid}, callSid: ${callSid}, lead_id: ${leadId}`
         );
+
         fastify.log.info(
-          `Twilio customParameters: ${JSON.stringify(msg.start?.customParameters || {})}`
+          `Twilio customParameters: ${JSON.stringify(
+            msg.start?.customParameters || {}
+          )}`
         );
 
         if (!leadId) {
@@ -342,7 +423,9 @@ fastify.register(async (fastify) => {
         }
 
         try {
-          const data = await callBase44("get_lead_context", { lead_id: leadId });
+          const data = await callBase44("get_lead_context", {
+            lead_id: leadId,
+          });
 
           lead = data.lead;
           realtorProfile = data.realtorProfile;
@@ -363,21 +446,14 @@ fastify.register(async (fastify) => {
       if (msg.event === "media") {
         if (!openAiWs) return;
 
-        const audioChunk = {
-          type: "input_audio_buffer.append",
-          audio: msg.media?.payload,
-        };
-
-        if (!audioChunk.audio) return;
+        const audioPayload = msg.media?.payload;
+        if (!audioPayload) return;
 
         if (sessionReady && openAiWs.readyState === WS_OPEN) {
-          safeSend(openAiWs, audioChunk);
-        } else if (audioQueue.length < MAX_AUDIO_QUEUE) {
-          audioQueue.push(audioChunk);
-        } else {
-          fastify.log.warn("Audio queue full; dropping oldest audio chunk");
-          audioQueue.shift();
-          audioQueue.push(audioChunk);
+          safeSend(openAiWs, {
+            type: "input_audio_buffer.append",
+            audio: audioPayload,
+          });
         }
 
         return;
@@ -390,14 +466,21 @@ fastify.register(async (fastify) => {
 
       if (msg.event === "stop") {
         fastify.log.info(`Twilio stream stopped for lead: ${leadId}`);
-        if (openAiWs?.readyState === WS_OPEN) openAiWs.close();
+
+        if (openAiWs?.readyState === WS_OPEN) {
+          openAiWs.close();
+        }
+
         return;
       }
     });
 
     twilioWs.on("close", () => {
       fastify.log.info(`Twilio WS closed for lead: ${leadId}`);
-      if (openAiWs?.readyState === WS_OPEN) openAiWs.close();
+
+      if (openAiWs?.readyState === WS_OPEN) {
+        openAiWs.close();
+      }
     });
 
     twilioWs.on("error", (err) => {
@@ -405,6 +488,10 @@ fastify.register(async (fastify) => {
     });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool Definitions
+// ─────────────────────────────────────────────────────────────────────────────
 
 function getTools() {
   return [
@@ -416,12 +503,25 @@ function getTools() {
       parameters: {
         type: "object",
         properties: {
-          lead_type: { type: "string", enum: ["buyer", "seller"] },
-          timeline: { type: "string" },
-          budget: { type: "string" },
-          pre_approved: { type: "boolean" },
-          working_with_agent: { type: "boolean" },
-          notes: { type: "string" },
+          lead_type: {
+            type: "string",
+            enum: ["buyer", "seller"],
+          },
+          timeline: {
+            type: "string",
+          },
+          budget: {
+            type: "string",
+          },
+          pre_approved: {
+            type: "boolean",
+          },
+          working_with_agent: {
+            type: "boolean",
+          },
+          notes: {
+            type: "string",
+          },
         },
         required: ["lead_type"],
       },
@@ -434,8 +534,12 @@ function getTools() {
       parameters: {
         type: "object",
         properties: {
-          reason: { type: "string" },
-          summary: { type: "string" },
+          reason: {
+            type: "string",
+          },
+          summary: {
+            type: "string",
+          },
         },
         required: ["reason"],
       },
@@ -448,7 +552,9 @@ function getTools() {
       parameters: {
         type: "object",
         properties: {
-          preferred_time: { type: "string" },
+          preferred_time: {
+            type: "string",
+          },
         },
       },
     },
@@ -462,15 +568,27 @@ function getTools() {
         properties: {
           reason: {
             type: "string",
-            enum: ["completed", "not_interested", "dnc_requested", "wrong_number", "no_answer"],
+            enum: [
+              "completed",
+              "not_interested",
+              "dnc_requested",
+              "wrong_number",
+              "no_answer",
+            ],
           },
-          summary: { type: "string" },
+          summary: {
+            type: "string",
+          },
         },
         required: ["reason"],
       },
     },
   ];
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool Handler
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function handleToolCall(
   name,
@@ -491,7 +609,7 @@ async function handleToolCall(
     safeSend(openAiWs, {
       type: "response.create",
       response: {
-        output_modalities: ["audio"],
+        modalities: ["audio"],
       },
     });
   };
@@ -504,7 +622,10 @@ async function handleToolCall(
       fastify.log.warn(`qualify_lead_from_call failed: ${err.message}`);
     });
 
-    ack({ success: true });
+    ack({
+      success: true,
+    });
+
     return;
   }
 
@@ -522,6 +643,7 @@ async function handleToolCall(
       message:
         "Tell the lead naturally: I just sent you a link to book a time that works for you.",
     });
+
     return;
   }
 
@@ -538,7 +660,9 @@ async function handleToolCall(
       const transferTwiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Joanna">Please hold while I connect you with the team.</Say>
-  <Dial timeout="20" answerOnBridge="true">${escapeXml(AGENT_TRANSFER_NUMBER)}</Dial>
+  <Dial timeout="20" answerOnBridge="true">${escapeXml(
+    AGENT_TRANSFER_NUMBER
+  )}</Dial>
   <Say voice="Polly.Joanna">Sorry, the team is not available right now. We will follow up with you shortly.</Say>
   <Hangup/>
 </Response>`;
@@ -562,10 +686,17 @@ async function handleToolCall(
         throw new Error(`Twilio transfer failed (${res.status}): ${text}`);
       }
 
-      ack({ success: true, message: "Transfer initiated." });
+      ack({
+        success: true,
+        message: "Transfer initiated.",
+      });
     } catch (err) {
       fastify.log.error(`Transfer failed: ${err.message}`);
-      ack({ success: false, error: err.message });
+
+      ack({
+        success: false,
+        error: err.message,
+      });
     }
 
     return;
@@ -586,20 +717,30 @@ async function handleToolCall(
     });
 
     setTimeout(() => {
-      if (twilioWs.readyState === WS_OPEN) twilioWs.close();
+      if (twilioWs.readyState === WS_OPEN) {
+        twilioWs.close();
+      }
     }, 4500);
 
     return;
   }
 
-  ack({ success: false, error: `Unknown tool: ${name}` });
+  ack({
+    success: false,
+    error: `Unknown tool: ${name}`,
+  });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// System Prompt
+// ─────────────────────────────────────────────────────────────────────────────
 
 function buildSystemPrompt(lead, realtorProfile) {
   const isaName = realtorProfile?.isa_name || "Emma";
   const teamName = realtorProfile?.display_name || "The Fugate Team";
   const firstName = lead?.name?.split(" ")[0] || "there";
   const source = lead?.source || "your inquiry";
+  const leadType = lead?.lead_type || "buyer";
 
   const property = lead?.property_address
     ? `They originally inquired about ${lead.property_address}${
@@ -610,8 +751,6 @@ function buildSystemPrompt(lead, realtorProfile) {
   const inquiryMessage = lead?.inquiry_message
     ? `Their original message was: "${lead.inquiry_message}".`
     : "";
-
-  const leadType = lead?.lead_type || "buyer";
 
   return `
 You are ${isaName}, a friendly and professional real estate ISA with ${teamName}.
@@ -650,6 +789,10 @@ Do not give legal, tax, or loan advice. Refer those questions to Daniel, Sarah, 
 Keep the tone calm, clear, professional, and conversational.
 `.trim();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Start Server
+// ─────────────────────────────────────────────────────────────────────────────
 
 const PORT = Number(process.env.PORT || 3000);
 
