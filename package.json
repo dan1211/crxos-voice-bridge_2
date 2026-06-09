@@ -1,0 +1,16 @@
+{
+  "name": "crxos-voice-bridge",
+  "version": "1.0.0",
+  "description": "Twilio ↔ OpenAI Realtime API voice bridge for CRX.OS ISA",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^8.3.1",
+    "fastify": "^4.26.2",
+    "ws": "^8.16.0"
+  }
+}
