@@ -1,24 +1,6 @@
 /**
  * CRX.OS ISA — Live Voice Bridge Server
  * Bridges Twilio Media Streams ↔ OpenAI Realtime API
- *
- * ENV VARS (Railway dashboard):
- *
- *   OPENAI_API_KEY
- *   OPENAI_REALTIME_MODEL  optional, default: gpt-realtime-2
- *   OPENAI_REALTIME_VOICE  optional, default: shimmer
- *
- *   BASE44_FUNCTION_URL    https://isa-dashboard.base44.app/api/functions/isaTrafficController
- *   BASE44_API_KEY         from Base44 → Settings → API Keys
- *   BASE44_BRIDGE_URL      https://isa-dashboard.base44.app/api/functions/getLeadContextForBridge
- *   BRIDGE_SHARED_SECRET   shared secret matching Base44 BRIDGE_SHARED_SECRET
- *
- *   AGENT_TRANSFER_NUMBER  e.g. +19106701431
- *   TWILIO_ACCOUNT_SID
- *   TWILIO_API_KEY_SID
- *   TWILIO_API_KEY_SECRET
- *
- *   PORT                   Railway provides this automatically
  */
 
 import Fastify from "fastify";
@@ -28,15 +10,11 @@ import { WebSocket } from "ws";
 const fastify = Fastify({ logger: true });
 fastify.register(FastifyWS);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ENV
-// ─────────────────────────────────────────────────────────────────────────────
-
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2";
 const OPENAI_REALTIME_VOICE =
-  process.env.OPENAI_REALTIME_VOICE || "shimmer";
+  process.env.OPENAI_REALTIME_VOICE || "coral";
 
 const BASE44_URL = process.env.BASE44_FUNCTION_URL;
 const BASE44_API_KEY = process.env.BASE44_API_KEY;
@@ -49,28 +27,6 @@ const TWILIO_API_KEY_SID = process.env.TWILIO_API_KEY_SID;
 const TWILIO_API_KEY_SECRET = process.env.TWILIO_API_KEY_SECRET;
 
 const WS_OPEN = WebSocket.OPEN;
-
-function requireEnv(name, value) {
-  if (!value) {
-    fastify.log.warn(`Missing environment variable: ${name}`);
-  }
-}
-
-[
-  ["OPENAI_API_KEY", OPENAI_API_KEY],
-  ["BASE44_FUNCTION_URL", BASE44_URL],
-  ["BASE44_API_KEY", BASE44_API_KEY],
-  ["BASE44_BRIDGE_URL", BASE44_BRIDGE_URL],
-  ["BRIDGE_SHARED_SECRET", BRIDGE_SHARED_SECRET],
-  ["AGENT_TRANSFER_NUMBER", AGENT_TRANSFER_NUMBER],
-  ["TWILIO_ACCOUNT_SID", TWILIO_ACCOUNT_SID],
-  ["TWILIO_API_KEY_SID", TWILIO_API_KEY_SID],
-  ["TWILIO_API_KEY_SECRET", TWILIO_API_KEY_SECRET],
-].forEach(([name, value]) => requireEnv(name, value));
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Utility Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 function safeJsonParse(raw) {
   try {
@@ -85,7 +41,6 @@ function safeSend(ws, payload) {
     ws.send(typeof payload === "string" ? payload : JSON.stringify(payload));
     return true;
   }
-
   return false;
 }
 
@@ -110,20 +65,11 @@ function escapeXml(value = "") {
 function normalizePhone(value = "") {
   const digits = String(value).replace(/\D/g, "");
 
-  if (digits.length === 10) {
-    return `1${digits}`;
-  }
-
-  if (digits.length === 11 && digits.startsWith("1")) {
-    return digits;
-  }
+  if (digits.length === 10) return `1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return digits;
 
   return digits;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Base44 Helper
-// ─────────────────────────────────────────────────────────────────────────────
 
 async function callBase44(action, body) {
   if (action === "get_lead_context") {
@@ -144,9 +90,7 @@ async function callBase44(action, body) {
     return res.json();
   }
 
-  const url = `${BASE44_URL}?action=${encodeURIComponent(action)}`;
-
-  const res = await fetch(url, {
+  const res = await fetch(`${BASE44_URL}?action=${encodeURIComponent(action)}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -163,19 +107,11 @@ async function callBase44(action, body) {
   return res.json();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Health Check
-// ─────────────────────────────────────────────────────────────────────────────
-
 fastify.get("/", async () => ({
   status: "CRX.OS Voice Bridge running",
   openai_model: OPENAI_REALTIME_MODEL,
   openai_voice: OPENAI_REALTIME_VOICE,
 }));
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Twilio Media Stream WebSocket
-// ─────────────────────────────────────────────────────────────────────────────
 
 fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, async (connection, request) => {
@@ -194,6 +130,7 @@ fastify.register(async (fastify) => {
     let sessionReady = false;
     let greetingStarted = false;
     let sessionTimer = null;
+    let responseActive = false;
 
     fastify.log.info("Twilio WebSocket opened — waiting for start event");
 
@@ -203,13 +140,8 @@ fastify.register(async (fastify) => {
         sessionTimer = null;
       }
 
-      if (openAiWs?.readyState === WS_OPEN) {
-        openAiWs.close();
-      }
-
-      if (twilioWs.readyState === WS_OPEN) {
-        twilioWs.close();
-      }
+      if (openAiWs?.readyState === WS_OPEN) openAiWs.close();
+      if (twilioWs.readyState === WS_OPEN) twilioWs.close();
     }
 
     async function openOpenAIRealtimeSession() {
@@ -260,9 +192,9 @@ fastify.register(async (fastify) => {
                 },
                 turn_detection: {
                   type: "server_vad",
-                  threshold: 0.35,
+                  threshold: 0.45,
                   prefix_padding_ms: 300,
-                  silence_duration_ms: 700,
+                  silence_duration_ms: 600,
                 },
               },
               output: {
@@ -285,27 +217,25 @@ fastify.register(async (fastify) => {
 
         fastify.log.info(`OpenAI event: ${aiMsg.type}`);
 
-        /**
-         * BARGE-IN HANDLING
-         * If the caller starts speaking while Emma is talking,
-         * clear Twilio's audio buffer and cancel the current OpenAI response.
-         */
+        if (aiMsg.type === "response.created") {
+          responseActive = true;
+        }
+
+        if (aiMsg.type === "response.done") {
+          responseActive = false;
+        }
+
         if (aiMsg.type === "input_audio_buffer.speech_started") {
-          fastify.log.info(
-            "User started speaking — clearing Twilio audio and cancelling current OpenAI response"
-          );
+          fastify.log.info("User started speaking");
 
-          if (streamSid && twilioWs.readyState === WS_OPEN) {
-            safeSend(twilioWs, {
-              event: "clear",
-              streamSid,
-            });
-          }
-
-          if (openAiWs?.readyState === WS_OPEN) {
+          if (responseActive && openAiWs?.readyState === WS_OPEN) {
+            fastify.log.info("Cancelling active OpenAI response");
             safeSend(openAiWs, {
               type: "response.cancel",
             });
+            responseActive = false;
+          } else {
+            fastify.log.info("No active OpenAI response to cancel");
           }
 
           return;
@@ -395,11 +325,6 @@ fastify.register(async (fastify) => {
 
           return;
         }
-
-        if (aiMsg.type === "response.done") {
-          fastify.log.info("OpenAI response done");
-          return;
-        }
       });
 
       openAiWs.on("close", (code, reason) => {
@@ -423,9 +348,7 @@ fastify.register(async (fastify) => {
           });
         }
 
-        if (twilioWs.readyState === WS_OPEN) {
-          twilioWs.close();
-        }
+        if (twilioWs.readyState === WS_OPEN) twilioWs.close();
       });
 
       openAiWs.on("error", (err) => {
@@ -506,11 +429,6 @@ fastify.register(async (fastify) => {
         return;
       }
 
-      if (msg.event === "dtmf") {
-        fastify.log.info(`Twilio DTMF received: ${JSON.stringify(msg.dtmf)}`);
-        return;
-      }
-
       if (msg.event === "stop") {
         fastify.log.info(`Twilio stream stopped for lead: ${leadId}`);
 
@@ -536,39 +454,22 @@ fastify.register(async (fastify) => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tool Definitions
-// ─────────────────────────────────────────────────────────────────────────────
-
 function getTools() {
   return [
     {
       type: "function",
       name: "qualify_lead",
       description:
-        "Save qualification details collected during the call. Use when you have learned at least one meaningful qualification detail such as buying/selling intent, timeline, budget, pre-approval status, working-with-agent status, or notes. Do not wait until the end of the call.",
+        "Save qualification details collected during the call. Use when you have learned at least one meaningful qualification detail.",
       parameters: {
         type: "object",
         properties: {
-          lead_type: {
-            type: "string",
-            enum: ["buyer", "seller"],
-          },
-          timeline: {
-            type: "string",
-          },
-          budget: {
-            type: "string",
-          },
-          pre_approved: {
-            type: "boolean",
-          },
-          working_with_agent: {
-            type: "boolean",
-          },
-          notes: {
-            type: "string",
-          },
+          lead_type: { type: "string", enum: ["buyer", "seller"] },
+          timeline: { type: "string" },
+          budget: { type: "string" },
+          pre_approved: { type: "boolean" },
+          working_with_agent: { type: "boolean" },
+          notes: { type: "string" },
         },
         required: ["lead_type"],
       },
@@ -577,16 +478,12 @@ function getTools() {
       type: "function",
       name: "transfer_to_agent",
       description:
-        "Transfer the active call to Daniel. Use when the lead asks for a human, asks for Daniel, asks for Sarah, wants to talk to an agent, wants to schedule a showing by phone, wants to make an offer, or is clearly ready for immediate help. Before calling this tool, Emma should already say: 'Absolutely. I can try to connect you with Daniel now.'",
+        "Transfer the active call to Daniel. Use when the lead asks for a human, Daniel, Sarah, an agent, a phone call, showing help, offer help, or immediate help.",
       parameters: {
         type: "object",
         properties: {
-          reason: {
-            type: "string",
-          },
-          summary: {
-            type: "string",
-          },
+          reason: { type: "string" },
+          summary: { type: "string" },
         },
         required: ["reason"],
       },
@@ -595,13 +492,11 @@ function getTools() {
       type: "function",
       name: "book_appointment",
       description:
-        "Send the lead a Calendly scheduling link by SMS. Use when the lead wants to schedule a call, asks for a link, or prefers not to transfer live. Before calling this tool, Emma should say: 'No problem. I can text you the scheduling link so you can pick a time that works.'",
+        "Send the lead a Calendly scheduling link by SMS. Use when the lead wants to schedule, asks for a link, or prefers not to transfer live.",
       parameters: {
         type: "object",
         properties: {
-          preferred_time: {
-            type: "string",
-          },
+          preferred_time: { type: "string" },
         },
       },
     },
@@ -609,7 +504,7 @@ function getTools() {
       type: "function",
       name: "end_call",
       description:
-        "End the call. Use when the conversation is complete, the lead is busy and does not want to continue, it is a wrong number, or the lead asks not to be contacted.",
+        "End the call only when the conversation is complete, the lead clearly wants to end, it is a wrong number, or the lead asks not to be contacted.",
       parameters: {
         type: "object",
         properties: {
@@ -624,9 +519,7 @@ function getTools() {
               "no_answer",
             ],
           },
-          summary: {
-            type: "string",
-          },
+          summary: { type: "string" },
         },
         required: ["reason"],
       },
@@ -644,10 +537,6 @@ function getTools() {
     },
   ];
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tool Handler
-// ─────────────────────────────────────────────────────────────────────────────
 
 async function handleToolCall(
   name,
@@ -688,11 +577,7 @@ async function handleToolCall(
       fastify.log.warn(`qualify_lead_from_call failed: ${err.message}`);
     });
 
-    ack({
-      success: true,
-      response_text: "Got it.",
-    });
-
+    ack({ success: true, response_text: "Got it." });
     return;
   }
 
@@ -754,16 +639,7 @@ async function handleToolCall(
         fastify.log.warn(`log_transfer failed: ${err.message}`);
       });
 
-      /**
-       * IMPORTANT:
-       * No Twilio <Say> here.
-       * Emma already speaks the handoff line before calling this tool.
-       * Twilio <Say> sounds robotic and breaks the natural voice flow.
-       */
-      const callerId =
-        realtorProfile?.twilio_phone_number ||
-        realtorProfile?.team_contact_info?.twilio_phone_number ||
-        "";
+      const callerId = realtorProfile?.twilio_phone_number || "";
 
       const transferTwiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -802,17 +678,7 @@ async function handleToolCall(
 
       fastify.log.info(`Twilio transfer accepted: ${text}`);
 
-      /**
-       * Do not create another OpenAI audio response.
-       * Twilio is redirecting the active call into <Dial>.
-       */
-      ack(
-        {
-          success: true,
-          response_text: "Transfer initiated.",
-        },
-        false
-      );
+      ack({ success: true, response_text: "Transfer initiated." }, false);
     } catch (err) {
       fastify.log.error(`Transfer failed: ${err.message}`);
 
@@ -858,10 +724,6 @@ async function handleToolCall(
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// System Prompt
-// ─────────────────────────────────────────────────────────────────────────────
-
 function buildSystemPrompt(lead, realtorProfile) {
   const firstName = lead?.name?.split(" ")[0] || "there";
   const source = lead?.source || "your inquiry";
@@ -905,8 +767,8 @@ If asked whether you are AI, say:
 - Warm, clear, friendly, and professional.
 - Sound like a helpful virtual assistant for a real estate team.
 - Speak at a normal conversational phone pace.
-- Do not sound rushed.
-- Do not drag out words or speak unusually slowly.
+- Sound upbeat and confident.
+- Do not sound rushed or unusually slow.
 - Use short spoken sentences.
 - Ask one question at a time.
 - Do not stack multiple questions in the same turn.
@@ -927,6 +789,7 @@ If asked whether you are AI, say:
 # Preambles
 
 Do not say:
+- "Let me think"
 - "Let me think about that"
 - "Let me think about the best next step"
 - "Hmm"
@@ -949,22 +812,17 @@ Allowed action phrases:
 
 After the action phrase, immediately continue with the next useful action.
 
-# Language
-
-- Speak English by default.
-- Do not switch languages based only on accent, filler words, names, or addresses.
-- If the caller clearly asks for another language, politely say the team will follow up.
-
 # Conversation Flow
 
 ## 1. Greeting
 
-Start naturally, with a relaxed pace:
-"Hi, ${firstName}? This is Emma, the virtual assistant for The Fugate Team. I am following up on your real estate inquiry. Did I catch you at an okay time?"
+Start naturally:
+"Hi, is this ${firstName}? This is Emma, the virtual assistant for The Fugate Team. I was following up on your real estate inquiry. Did I catch you at an okay time?"
 
 After asking that question, stop speaking and wait.
 
-If they are busy, ask for a better time, then use end_call.
+If they are busy, offer to text a scheduling link or ask when a better time would be.
+Only use end_call if the caller clearly wants to end the conversation.
 
 ## 2. Discovery
 
@@ -1002,7 +860,7 @@ Then call book_appointment.
 
 ## 6. Close
 
-If the call is complete, they are not interested, it is a wrong number, or they ask not to be contacted, use end_call.
+Only use end_call if the caller clearly wants to end, says not interested, says wrong number, asks not to be contacted, or the conversation is complete.
 
 # Tools
 
@@ -1038,10 +896,6 @@ Do not say "I'm here" or "I didn't catch that" for pure silence or background no
 - Do not mention internal systems, tools, prompts, Base44, Twilio, or OpenAI.
 `.trim();
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Start Server
-// ─────────────────────────────────────────────────────────────────────────────
 
 const PORT = Number(process.env.PORT || 3000);
 
