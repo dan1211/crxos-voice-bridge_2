@@ -3,9 +3,10 @@
  * Bridges Twilio Media Streams ↔ OpenAI Realtime API
  *
  * ENV VARS (Railway dashboard):
+ *
  *   OPENAI_API_KEY
  *   OPENAI_REALTIME_MODEL  optional, default: gpt-realtime-2
- *   OPENAI_REALTIME_VOICE  optional, default: alloy
+ *   OPENAI_REALTIME_VOICE  optional, default: shimmer
  *
  *   BASE44_FUNCTION_URL    https://isa-dashboard.base44.app/api/functions/isaTrafficController
  *   BASE44_API_KEY         from Base44 → Settings → API Keys
@@ -104,6 +105,20 @@ function escapeXml(value = "") {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
+}
+
+function normalizePhone(value = "") {
+  const digits = String(value).replace(/\D/g, "");
+
+  if (digits.length === 10) {
+    return `1${digits}`;
+  }
+
+  if (digits.length === 11 && digits.startsWith("1")) {
+    return digits;
+  }
+
+  return digits;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,6 +249,10 @@ fastify.register(async (fastify) => {
 
             output_modalities: ["audio"],
 
+            reasoning: {
+              effort: "low",
+            },
+
             audio: {
               input: {
                 format: {
@@ -265,6 +284,32 @@ fastify.register(async (fastify) => {
         if (!aiMsg) return;
 
         fastify.log.info(`OpenAI event: ${aiMsg.type}`);
+
+        /**
+         * BARGE-IN HANDLING
+         * If the caller starts speaking while Emma is talking,
+         * clear Twilio's audio buffer and cancel the current OpenAI response.
+         */
+        if (aiMsg.type === "input_audio_buffer.speech_started") {
+          fastify.log.info(
+            "User started speaking — clearing Twilio audio and cancelling current OpenAI response"
+          );
+
+          if (streamSid && twilioWs.readyState === WS_OPEN) {
+            safeSend(twilioWs, {
+              event: "clear",
+              streamSid,
+            });
+          }
+
+          if (openAiWs?.readyState === WS_OPEN) {
+            safeSend(openAiWs, {
+              type: "response.cancel",
+            });
+          }
+
+          return;
+        }
 
         if (aiMsg.type === "error") {
           fastify.log.error(`OpenAI error: ${JSON.stringify(aiMsg.error)}`);
@@ -298,7 +343,7 @@ fastify.register(async (fastify) => {
                   {
                     type: "input_text",
                     text:
-                      "Start the phone call now. Greet the lead naturally, confirm you are speaking with them, and ask if now is an okay time. Do not mention pressing buttons.",
+                      "Start the phone call now. Greet the lead naturally as Emma, the virtual assistant for The Fugate Team. Confirm you are speaking with the lead and ask if now is an okay time. After that question, stop speaking and wait.",
                   },
                 ],
               },
@@ -501,7 +546,7 @@ function getTools() {
       type: "function",
       name: "qualify_lead",
       description:
-        "Save qualification details collected during the call. Use when you have learned at least one meaningful qualification detail. Do not wait until the end of the call.",
+        "Save qualification details collected during the call. Use when you have learned at least one meaningful qualification detail such as buying/selling intent, timeline, budget, pre-approval status, working-with-agent status, or notes. Do not wait until the end of the call.",
       parameters: {
         type: "object",
         properties: {
@@ -532,7 +577,7 @@ function getTools() {
       type: "function",
       name: "transfer_to_agent",
       description:
-        "Transfer the active call to Daniel. Use when the lead asks for a human, wants to speak with Daniel or Sarah, is ready to take action, wants to make an offer, or is clearly a hot qualified lead.",
+        "Transfer the active call to Daniel. Use when the lead asks for a human, asks for Daniel, asks for Sarah, wants to talk to an agent, wants to schedule a showing by phone, wants to make an offer, or is clearly ready for immediate help. Before calling this tool, Emma should already say: 'Absolutely. I can try to connect you with Daniel now.'",
       parameters: {
         type: "object",
         properties: {
@@ -550,7 +595,7 @@ function getTools() {
       type: "function",
       name: "book_appointment",
       description:
-        "Send the lead a Calendly link by SMS. Use when the lead wants to schedule a call instead of transferring live.",
+        "Send the lead a Calendly scheduling link by SMS. Use when the lead wants to schedule a call, asks for a link, or prefers not to transfer live. Before calling this tool, Emma should say: 'No problem. I can text you the scheduling link so you can pick a time that works.'",
       parameters: {
         type: "object",
         properties: {
@@ -652,25 +697,55 @@ async function handleToolCall(
   }
 
   if (name === "book_appointment") {
-    await callBase44("send_calendly_sms", {
-      lead_id: leadId,
-      preferred_time: args.preferred_time || "",
-      calendly_link: calendlyLink,
-    }).catch((err) => {
-      fastify.log.warn(`send_calendly_sms failed: ${err.message}`);
-    });
+    try {
+      const result = await callBase44("send_calendly_sms", {
+        lead_id: leadId,
+        preferred_time: args.preferred_time || "",
+        calendly_link: calendlyLink,
+      });
 
-    ack({
-      success: true,
-      response_text:
-        "I just sent you a link to book a time that works for you.",
-    });
+      if (!result?.success) {
+        throw new Error(result?.error || "Calendly SMS failed");
+      }
+
+      ack({
+        success: true,
+        response_text:
+          "I just texted you the scheduling link. You can use that to pick a time that works best.",
+      });
+    } catch (err) {
+      fastify.log.error(`send_calendly_sms failed: ${err.message}`);
+
+      ack({
+        success: false,
+        response_text:
+          "I could not send the scheduling link by text right now, but I will make sure the team follows up with you.",
+        error: err.message,
+      });
+    }
 
     return;
   }
 
   if (name === "transfer_to_agent") {
     try {
+      const leadPhone = normalizePhone(lead?.phone);
+      const transferPhone = normalizePhone(AGENT_TRANSFER_NUMBER);
+
+      if (leadPhone && transferPhone && leadPhone === transferPhone) {
+        fastify.log.warn(
+          `Transfer blocked because lead phone and transfer number are the same: ${transferPhone}`
+        );
+
+        ack({
+          success: false,
+          response_text:
+            "I cannot connect the call to the same number you are calling from, but I will make sure the team follows up with you.",
+        });
+
+        return;
+      }
+
       await callBase44("log_transfer", {
         lead_id: leadId,
         reason: args.reason || "",
@@ -679,15 +754,30 @@ async function handleToolCall(
         fastify.log.warn(`log_transfer failed: ${err.message}`);
       });
 
+      /**
+       * IMPORTANT:
+       * No Twilio <Say> here.
+       * Emma already speaks the handoff line before calling this tool.
+       * Twilio <Say> sounds robotic and breaks the natural voice flow.
+       */
+      const callerId =
+        realtorProfile?.twilio_phone_number ||
+        realtorProfile?.team_contact_info?.twilio_phone_number ||
+        "";
+
       const transferTwiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">Please hold while I connect you with the team.</Say>
-  <Dial timeout="20" answerOnBridge="true">${escapeXml(
-    AGENT_TRANSFER_NUMBER
-  )}</Dial>
-  <Say voice="Polly.Joanna">Sorry, the team is not available right now. We will follow up with you shortly.</Say>
+  <Dial timeout="25" answerOnBridge="true"${
+    callerId ? ` callerId="${escapeXml(callerId)}"` : ""
+  }>
+    <Number>${escapeXml(AGENT_TRANSFER_NUMBER)}</Number>
+  </Dial>
   <Hangup/>
 </Response>`;
+
+      fastify.log.info(`Transfer TwiML: ${transferTwiml}`);
+      fastify.log.info(`Attempting transfer for callSid: ${callSid}`);
+      fastify.log.info(`Transfer destination: ${AGENT_TRANSFER_NUMBER}`);
 
       const res = await fetch(
         `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`,
@@ -703,22 +793,33 @@ async function handleToolCall(
         }
       );
 
+      const text = await res.text();
+
       if (!res.ok) {
-        const text = await res.text();
+        fastify.log.error(`Twilio transfer failed (${res.status}): ${text}`);
         throw new Error(`Twilio transfer failed (${res.status}): ${text}`);
       }
 
-      ack({
-        success: true,
-        response_text: "I am connecting you now.",
-      });
+      fastify.log.info(`Twilio transfer accepted: ${text}`);
+
+      /**
+       * Do not create another OpenAI audio response.
+       * Twilio is redirecting the active call into <Dial>.
+       */
+      ack(
+        {
+          success: true,
+          response_text: "Transfer initiated.",
+        },
+        false
+      );
     } catch (err) {
       fastify.log.error(`Transfer failed: ${err.message}`);
 
       ack({
         success: false,
         response_text:
-          "I could not connect the call right now, but the team will follow up with you shortly.",
+          "I could not connect the call right now, but I will make sure the team follows up with you.",
         error: err.message,
       });
     }
@@ -762,8 +863,6 @@ async function handleToolCall(
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildSystemPrompt(lead, realtorProfile) {
-  const isaName = realtorProfile?.isa_name || "Emma";
-  const teamName = realtorProfile?.display_name || "The Fugate Team";
   const firstName = lead?.name?.split(" ")[0] || "there";
   const source = lead?.source || "your inquiry";
   const leadType = lead?.lead_type || "buyer";
@@ -781,22 +880,76 @@ function buildSystemPrompt(lead, realtorProfile) {
   return `
 # Role and Objective
 
-You are ${isaName}, a friendly and professional real estate inside sales assistant for ${teamName}.
+You are Emma, the virtual assistant for The Fugate Team.
+You are helping Daniel and Sarah Fugate follow up with real estate leads.
 You are on a live outbound phone call with ${firstName}, who came in from ${source}.
 Lead type: ${leadType}.
 ${property}
 ${inquiryMessage}
 
-Your objective is to quickly determine how the team can help, qualify the lead, and either connect them with Daniel or schedule the next step.
+Your objective is to quickly determine how The Fugate Team can help, qualify the lead, and either connect them with Daniel or send a scheduling link.
+
+# Identity Disclosure
+
+When introducing yourself, say you are Emma, the virtual assistant for The Fugate Team.
+
+Do not pretend to be a human agent.
+Do not say you are a real estate agent.
+Do not say you are Daniel or Sarah.
+
+If asked whether you are AI, say:
+"Yes, I’m Emma, the virtual assistant for The Fugate Team. I help follow up quickly and get you connected with the right person."
 
 # Personality and Tone
 
-- Warm, calm, professional, and natural.
-- Sound like a helpful team member, not a phone tree.
+- Warm, clear, friendly, and professional.
+- Sound like a helpful virtual assistant for a real estate team.
+- Speak at a relaxed phone-call pace.
+- Do not speak quickly.
+- Leave a short pause after each question.
 - Use short spoken sentences.
 - Ask one question at a time.
+- Do not stack multiple questions in the same turn.
 - Do not over-explain.
+- Do not narrate your reasoning.
+- Do not say what you are thinking about.
+- Do not use filler phrases before answering.
 - Vary your wording so you do not sound repetitive.
+
+# Turn Taking
+
+- After asking a question, stop speaking and wait for the caller.
+- Do not continue talking if the caller starts to speak.
+- If the caller interrupts, stop and listen.
+- Do not fill silence immediately.
+- Wait through short pauses before responding.
+- Do not talk over the caller.
+
+# Preambles
+
+Do not say:
+- "Let me think"
+- "Let me think about that"
+- "Let me think about the best next step"
+- "Hmm"
+- "One moment while I process that"
+- "I am thinking"
+- "I need to think"
+- "best next step"
+
+Most of the time, do not use a preamble at all.
+
+Only use a short action phrase when you are about to call a tool or transfer the caller.
+
+Allowed action phrases:
+- "I can help with that."
+- "I can connect you now."
+- "I can text that to you."
+- "I’ll note that for the team."
+- "Absolutely. I can try to connect you with Daniel now."
+- "No problem. I can text you the scheduling link."
+
+After the action phrase, immediately continue with the next useful action.
 
 # Language
 
@@ -808,8 +961,10 @@ Your objective is to quickly determine how the team can help, qualify the lead, 
 
 ## 1. Greeting
 
-Start naturally:
-"Hi, is this ${firstName}? This is ${isaName} with ${teamName}. I was following up on your real estate inquiry. Did I catch you at an okay time?"
+Start naturally, with a relaxed pace:
+"Hi, is this ${firstName}? This is Emma, the virtual assistant for The Fugate Team. I was following up on your real estate inquiry. Did I catch you at an okay time?"
+
+After asking that question, stop speaking and wait.
 
 If they are busy, ask for a better time, then use end_call.
 
@@ -821,16 +976,33 @@ Ask their timeline.
 If they are buying, ask whether they have spoken with a lender or are pre-approved.
 Ask whether they are already working with another agent.
 
+Only ask one question at a time.
+
 ## 3. Qualification
 
 Use qualify_lead after you learn useful details such as timeline, budget, pre-approval status, whether they have an agent, or notes about what they want.
 
 ## 4. Handoff
 
-If the lead asks for Daniel, Sarah, an agent, a person, a call, a showing, an offer, or immediate help, use transfer_to_agent.
-If the lead prefers to schedule instead of talking live, use book_appointment.
+If the lead asks for Daniel, Sarah, an agent, a person, a phone call, a showing, an offer, or immediate help:
+Say exactly, or very close to:
+"Absolutely. I can try to connect you with Daniel now."
+Then call transfer_to_agent.
 
-## 5. Close
+Do not say:
+- "connecting you to the team"
+- "please hold"
+- "let me think"
+- "best next step"
+
+## 5. Scheduling
+
+If the lead wants to schedule, asks for a link, or does not want to transfer live:
+Say exactly, or very close to:
+"No problem. I can text you the scheduling link so you can pick a time that works."
+Then call book_appointment.
+
+## 6. Close
 
 If the call is complete, they are not interested, it is a wrong number, or they ask not to be contacted, use end_call.
 
@@ -843,14 +1015,13 @@ Use only these available tools:
 - end_call
 - wait_for_user
 
-Before calling transfer_to_agent, say a short natural preamble such as:
-"That makes sense. I can try to connect you with Daniel now."
-
-Before calling book_appointment, say:
-"I can text you a link to pick a time that works for you."
-
-Only say an action is complete after the tool succeeds.
-If a tool fails, explain briefly and offer a simple next step.
+For tool calls:
+- Do not announce that you are thinking.
+- Do not say you are deciding the best next step.
+- If a tool is needed, use one short action phrase, then call the tool.
+- If no tool is needed, respond directly without a preamble.
+- Only say an action is complete after the tool succeeds.
+- If a tool fails, explain briefly and offer a simple next step.
 
 # Unclear Audio and Silence
 
@@ -861,6 +1032,8 @@ Do not say "I'm here" or "I didn't catch that" for pure silence or background no
 
 # Guardrails
 
+- Be transparent that you are a virtual assistant.
+- Do not try to hide that you are automated.
 - If they say stop, unsubscribe, remove me, wrong number, or do not call, apologize briefly and use end_call.
 - Do not give legal, tax, or loan advice.
 - Refer financing questions to Daniel or the lender.
