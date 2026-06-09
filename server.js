@@ -233,11 +233,11 @@ fastify.register(async (fastify) => {
           type: "session.update",
           session: {
             type: "realtime",
-            model: OPENAI_REALTIME_MODEL,
+            model: gpt-realtime-2,
            instructions: systemPrompt,
 
             modalities: ["text", "audio"],
-            voice: OPENAI_REALTIME_VOICE,
+            voice: gpt-realtime-2,
 
             input_audio_format: "g711_ulaw",
             output_audio_format: "g711_ulaw",
