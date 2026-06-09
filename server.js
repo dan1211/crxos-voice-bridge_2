@@ -35,7 +35,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2";
 const OPENAI_REALTIME_VOICE =
-  process.env.OPENAI_REALTIME_VOICE || "coral";
+  process.env.OPENAI_REALTIME_VOICE || "shimmer";
 
 const BASE44_URL = process.env.BASE44_FUNCTION_URL;
 const BASE44_API_KEY = process.env.BASE44_API_KEY;
@@ -241,9 +241,9 @@ fastify.register(async (fastify) => {
                 },
                 turn_detection: {
                   type: "server_vad",
-                  threshold: 0.5,
-                  prefix_padding_ms: 300,
-                  silence_duration_ms: 500,
+                  threshold: 0.35,
+                  prefix_padding_ms: 500,
+                  silence_duration_ms: 900,
                 },
               },
               output: {
