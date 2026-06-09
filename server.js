@@ -237,7 +237,7 @@ fastify.register(async (fastify) => {
             audio: {
               input: {
                 format: {
-                  type: "g711_ulaw",
+                  type: "audio/pcmu",
                 },
                 turn_detection: {
                   type: "server_vad",
@@ -248,7 +248,7 @@ fastify.register(async (fastify) => {
               },
               output: {
                 format: {
-                  type: "g711_ulaw",
+                  type: "audio/pcmu",
                 },
                 voice: OPENAI_REALTIME_VOICE,
               },
