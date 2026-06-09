@@ -504,7 +504,7 @@ function getTools() {
       type: "function",
       name: "end_call",
       description:
-        "End the call only when the conversation is complete, the lead clearly wants to end, it is a wrong number, or the lead asks not to be contacted.",
+        "End the call only when the caller explicitly says goodbye, says they want to hang up, says wrong number, says stop calling, says do not call, or clearly ends the conversation. Do not use this tool for silence, hesitation, unclear audio, short answers, or when the caller sounds busy. If unsure, keep listening or ask one brief follow-up question.",
       parameters: {
         type: "object",
         properties: {
@@ -893,7 +893,28 @@ Then call book_appointment.
 
 ## 6. Close
 
-Only use end_call if the caller clearly wants to end, says not interested, says wrong number, asks not to be contacted, or the conversation is complete.
+Only use end_call when the caller clearly and explicitly wants the call to end.
+
+Use end_call if the caller says:
+- goodbye
+- bye
+- I have to go
+- stop calling
+- do not call me
+- wrong number
+- not interested
+
+Do not use end_call for:
+- silence
+- short pauses
+- unclear audio
+- hesitation
+- brief answers
+- background noise
+- the caller sounding busy but still engaged
+
+If unsure, ask:
+"No problem — would you like me to have Daniel follow up later?"
 
 # Tools
 
