@@ -6,6 +6,8 @@
  *   OPENAI_API_KEY
  *   BASE44_FUNCTION_URL    https://isa-dashboard.base44.app/api/functions/isaTrafficController
  *   BASE44_API_KEY         from Base44 → Settings → API Keys
+ *   BASE44_BRIDGE_URL      https://isa-dashboard.base44.app/api/functions/getLeadContextForBridge
+ *   BRIDGE_SHARED_SECRET   shared secret matching Base44 BRIDGE_SHARED_SECRET
  *   AGENT_TRANSFER_NUMBER  e.g. +19105551234
  *   TWILIO_ACCOUNT_SID
  *   TWILIO_API_KEY_SID
@@ -23,6 +25,8 @@ fastify.register(FastifyWS);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const BASE44_URL = process.env.BASE44_FUNCTION_URL;
 const BASE44_API_KEY = process.env.BASE44_API_KEY;
+const BASE44_BRIDGE_URL = process.env.BASE44_BRIDGE_URL;
+const BRIDGE_SHARED_SECRET = process.env.BRIDGE_SHARED_SECRET;
 const AGENT_TRANSFER_NUMBER = process.env.AGENT_TRANSFER_NUMBER;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_API_KEY_SID = process.env.TWILIO_API_KEY_SID;
@@ -30,6 +34,24 @@ const TWILIO_API_KEY_SECRET = process.env.TWILIO_API_KEY_SECRET;
 
 // ─── Base44 Helper ─────────────────────────────────────────────────────────────
 async function callBase44(action, body) {
+  // get_lead_context uses the dedicated bridge function with shared secret
+  if (action === "get_lead_context") {
+    const res = await fetch(BASE44_BRIDGE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-bridge-secret": BRIDGE_SHARED_SECRET,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Bridge function failed (${res.status}): ${text}`);
+    }
+    return res.json();
+  }
+
+  // All other actions use the main isaTrafficController with x-api-key
   const res = await fetch(`${BASE44_URL}?action=${action}`, {
     method: "POST",
     headers: {
@@ -53,7 +75,6 @@ fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, async (connection, request) => {
     const twilioWs = connection.socket;
 
-    // State — populated when we receive the Twilio "start" event
     let leadId = null;
     let callSid = null;
     let lead = null;
@@ -75,19 +96,16 @@ fastify.register(async (fastify) => {
         return;
       }
 
-      // ── connected event (Twilio sends this first, before start) ────────────
+      // ── connected ──────────────────────────────────────────────────────────
       if (msg.event === "connected") {
         fastify.log.info("Twilio connected event received");
         return;
       }
 
-      // ── start event: extract lead_id from customParameters ─────────────────
+      // ── start: extract lead_id from customParameters ───────────────────────
       if (msg.event === "start") {
         streamSid = msg.start.streamSid;
         callSid = msg.start.callSid;
-
-        // Primary: customParameters (set via <Parameter> tags in TwiML)
-        // Fallback: query params (in case URL params work in some environments)
         leadId =
           msg.start.customParameters?.lead_id ||
           request.query?.lead_id ||
@@ -106,8 +124,11 @@ fastify.register(async (fastify) => {
           return;
         }
 
-        // Load lead context from Base44
+        // Load lead context via dedicated bridge function
         try {
+          fastify.log.info(`Calling bridge function for lead: ${leadId}`);
+          fastify.log.info(`BASE44_BRIDGE_URL: ${BASE44_BRIDGE_URL}`);
+          fastify.log.info(`BRIDGE_SHARED_SECRET set: ${!!BRIDGE_SHARED_SECRET}`);
           const data = await callBase44("get_lead_context", { lead_id: leadId });
           lead = data.lead;
           realtorProfile = data.realtorProfile;
@@ -115,12 +136,13 @@ fastify.register(async (fastify) => {
           systemPrompt = buildSystemPrompt(lead, realtorProfile);
           fastify.log.info(`Lead loaded: ${lead?.name} (${leadId})`);
         } catch (err) {
-          fastify.log.error("Failed to load lead context:", err.message);
+          fastify.log.error(`Failed to load lead context: ${err.message}`);
           twilioWs.close();
           return;
         }
 
         // Open OpenAI Realtime session
+        fastify.log.info(`Opening OpenAI WS — API key starts with: ${OPENAI_API_KEY?.substring(0, 8)}`);
         openAiWs = new WebSocket(
           "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
           [
@@ -157,7 +179,6 @@ fastify.register(async (fastify) => {
             return;
           }
 
-          // Session ready — flush buffered audio and trigger greeting
           if (aiMsg.type === "session.updated") {
             fastify.log.info("OpenAI session ready — triggering greeting");
             sessionReady = true;
@@ -166,7 +187,6 @@ fastify.register(async (fastify) => {
             openAiWs.send(JSON.stringify({ type: "response.create" }));
           }
 
-          // Stream AI audio back to Twilio
           if (
             aiMsg.type === "response.audio.delta" &&
             streamSid &&
@@ -181,7 +201,6 @@ fastify.register(async (fastify) => {
             );
           }
 
-          // Tool call
           if (aiMsg.type === "response.function_call_arguments.done") {
             fastify.log.info(`Tool call: ${aiMsg.name}`);
             await handleToolCall(
@@ -193,22 +212,22 @@ fastify.register(async (fastify) => {
           }
         });
 
-        openAiWs.on("close", () => {
-          fastify.log.info(`OpenAI WS closed for lead: ${leadId}`);
+        openAiWs.on("close", (code, reason) => {
+          fastify.log.info(`OpenAI WS closed — code: ${code}, reason: ${reason?.toString()}`);
           if (twilioWs.readyState === 1) twilioWs.close();
           callBase44("voice_call_ended", { lead_id: leadId, call_sid: callSid }).catch(() => {});
         });
 
         openAiWs.on("error", (err) =>
-          fastify.log.error("OpenAI WS error:", err.message)
+          fastify.log.error(`OpenAI WS error: ${err.message}`)
         );
 
         return;
       }
 
-      // ── media event: forward audio to OpenAI ───────────────────────────────
+      // ── media: forward audio to OpenAI ────────────────────────────────────
       if (msg.event === "media") {
-        if (!openAiWs) return; // not ready yet
+        if (!openAiWs) return;
         const audioChunk = JSON.stringify({
           type: "input_audio_buffer.append",
           audio: msg.media.payload,
@@ -221,7 +240,7 @@ fastify.register(async (fastify) => {
         return;
       }
 
-      // ── stop event ─────────────────────────────────────────────────────────
+      // ── stop ───────────────────────────────────────────────────────────────
       if (msg.event === "stop") {
         fastify.log.info(`Twilio stream stopped for lead: ${leadId}`);
         if (openAiWs?.readyState === 1) openAiWs.close();
@@ -234,7 +253,7 @@ fastify.register(async (fastify) => {
     });
 
     twilioWs.on("error", (err) =>
-      fastify.log.error("Twilio WS error:", err.message)
+      fastify.log.error(`Twilio WS error: ${err.message}`)
     );
   });
 });
@@ -245,8 +264,7 @@ function getTools() {
     {
       type: "function",
       name: "qualify_lead",
-      description:
-        "Save qualification details collected during the call. Call this as soon as you have the key facts — don't wait until the end.",
+      description: "Save qualification details collected during the call. Call this as soon as you have the key facts — don't wait until the end.",
       parameters: {
         type: "object",
         properties: {
@@ -263,8 +281,7 @@ function getTools() {
     {
       type: "function",
       name: "transfer_to_agent",
-      description:
-        "Use when the lead asks to speak to a person, is ready to make an offer, or is clearly a hot qualified lead.",
+      description: "Use when the lead asks to speak to a person, is ready to make an offer, or is clearly a hot qualified lead.",
       parameters: {
         type: "object",
         properties: {
@@ -276,8 +293,7 @@ function getTools() {
     {
       type: "function",
       name: "book_appointment",
-      description:
-        "Use when the lead wants to schedule a call. Send them the Calendly link via SMS.",
+      description: "Use when the lead wants to schedule a call. Send them the Calendly link via SMS.",
       parameters: {
         type: "object",
         properties: {
@@ -288,8 +304,7 @@ function getTools() {
     {
       type: "function",
       name: "end_call",
-      description:
-        "Use when the conversation is complete, the lead wants to go, or they asked to stop contact.",
+      description: "Use when the conversation is complete, the lead wants to go, or they asked to stop contact.",
       parameters: {
         type: "object",
         properties: {
@@ -312,16 +327,14 @@ async function handleToolCall(
   { lead, realtorProfile, callSid, calendlyLink, openAiWs, twilioWs, leadId }
 ) {
   const ack = (output) => {
-    openAiWs.send(
-      JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-          type: "function_call_output",
-          call_id: callId,
-          output: JSON.stringify(output),
-        },
-      })
-    );
+    openAiWs.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "function_call_output",
+        call_id: callId,
+        output: JSON.stringify(output),
+      },
+    }));
     openAiWs.send(JSON.stringify({ type: "response.create" }));
   };
 
@@ -345,8 +358,7 @@ async function handleToolCall(
   if (name === "transfer_to_agent") {
     try {
       const authHeader =
-        "Basic " +
-        Buffer.from(`${TWILIO_API_KEY_SID}:${TWILIO_API_KEY_SECRET}`).toString("base64");
+        "Basic " + Buffer.from(`${TWILIO_API_KEY_SID}:${TWILIO_API_KEY_SECRET}`).toString("base64");
       await fetch(
         `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`,
         {
@@ -363,7 +375,7 @@ async function handleToolCall(
       await callBase44("log_transfer", { lead_id: leadId, reason: args.reason }).catch(() => {});
       ack({ success: true });
     } catch (err) {
-      fastify.log.error("Transfer failed:", err.message);
+      fastify.log.error(`Transfer failed: ${err.message}`);
       ack({ success: false, error: err.message });
     }
   }
