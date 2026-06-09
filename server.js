@@ -5,11 +5,13 @@
  *
  * ENV VARS NEEDED (set in Railway dashboard):
  *   OPENAI_API_KEY
- *   BASE44_FUNCTION_URL       ← your existing Base44 function URL
+ *   BASE44_FUNCTION_URL       ← https://isa-dashboard.base44.app/api/functions/isaTrafficController
+ *   BASE44_API_KEY            ← from Base44 → Settings → API Keys
  *   AGENT_TRANSFER_NUMBER     ← e.g. +19105551234
  *   TWILIO_ACCOUNT_SID
  *   TWILIO_API_KEY_SID
  *   TWILIO_API_KEY_SECRET
+ *   PORT                      ← 3000
  */
 
 import Fastify from "fastify";
@@ -20,40 +22,47 @@ fastify.register(FastifyWS);
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const BASE44_URL = process.env.BASE44_FUNCTION_URL;
+const BASE44_API_KEY = process.env.BASE44_API_KEY;
 const AGENT_TRANSFER_NUMBER = process.env.AGENT_TRANSFER_NUMBER;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_API_KEY_SID = process.env.TWILIO_API_KEY_SID;
 const TWILIO_API_KEY_SECRET = process.env.TWILIO_API_KEY_SECRET;
 
+// ─── Base44 Helper ────────────────────────────────────────────────────────────
+async function callBase44(action, body) {
+  const res = await fetch(`${BASE44_URL}?action=${action}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": BASE44_API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Base44 ${action} failed (${res.status}): ${text}`);
+  }
+  return res.json();
+}
+
 // ─── Health Check ─────────────────────────────────────────────────────────────
 fastify.get("/", async () => ({ status: "CRX.OS Voice Bridge running" }));
-
-// ─── Twilio calls this first to get TwiML with the stream URL ─────────────────
-// In Base44, your voice_answer action should now return this TwiML:
-//
-//   <Response>
-//     <Connect>
-//       <Stream url="wss://YOUR-RAILWAY-URL/media-stream?lead_id=XXX&call_sid={{CallSid}}"/>
-//     </Connect>
-//   </Response>
-//
-// Pass call_sid through so we can do mid-call transfers.
 
 // ─── WebSocket: Media Stream Bridge ──────────────────────────────────────────
 fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, async (connection, request) => {
-  const leadId = request.query.lead_id || null;
-  const callSid = request.query.call_sid || "";
+    const leadId = request.query.lead_id || null;
+    const callSid = request.query.call_sid || "";
 
-  fastify.log.info(`WebSocket connected — lead_id: ${leadId}, call_sid: ${callSid}`);
+    fastify.log.info(`WebSocket connected — lead_id: ${leadId}, call_sid: ${callSid}`);
 
-  if (!leadId) {
-    fastify.log.error("No lead_id — closing");
-    connection.socket.close();
-    return;
-  }
+    if (!leadId) {
+      fastify.log.error("No lead_id in WebSocket URL — closing connection");
+      connection.socket.close();
+      return;
+    }
 
-  const twilioWs = connection.socket;
+    const twilioWs = connection.socket;
 
     // Fetch lead + realtor profile from Base44
     let lead = null;
@@ -62,15 +71,14 @@ fastify.register(async (fastify) => {
     let calendlyLink = "";
 
     try {
-      const res = await fetch(`${BASE44_URL}?action=get_lead_context&lead_id=${leadId}`);
-      const data = await res.json();
+      const data = await callBase44("get_lead_context", { lead_id: leadId });
       lead = data.lead;
       realtorProfile = data.realtorProfile;
       calendlyLink = realtorProfile?.calendly_link || "";
-
       systemPrompt = buildSystemPrompt(lead, realtorProfile);
+      fastify.log.info(`Lead context loaded: ${lead?.name} (${lead?.id})`);
     } catch (err) {
-      fastify.log.error("Failed to load lead context:", err);
+      fastify.log.error("Failed to load lead context:", err.message);
       twilioWs.close();
       return;
     }
@@ -87,10 +95,11 @@ fastify.register(async (fastify) => {
 
     let streamSid = "";
     let sessionReady = false;
-    const audioQueue = []; // buffer audio that arrives before session is ready
+    const audioQueue = [];
 
     // ── OpenAI session config on connect ─────────────────────────────────────
     openAiWs.on("open", () => {
+      fastify.log.info("OpenAI Realtime WS opened");
       openAiWs.send(
         JSON.stringify({
           type: "session.update",
@@ -112,14 +121,14 @@ fastify.register(async (fastify) => {
     openAiWs.on("message", async (raw) => {
       const msg = JSON.parse(raw);
 
-      // Session ready — flush any buffered audio
+      // Session ready — flush buffered audio and trigger greeting
       if (msg.type === "session.updated") {
+        fastify.log.info("OpenAI session ready — flushing audio queue");
         sessionReady = true;
         for (const chunk of audioQueue) {
           openAiWs.send(chunk);
         }
         audioQueue.length = 0;
-        // Trigger opening greeting
         openAiWs.send(JSON.stringify({ type: "response.create" }));
       }
 
@@ -138,8 +147,9 @@ fastify.register(async (fastify) => {
         );
       }
 
-      // Tool call completed — handle it
+      // Tool call completed
       if (msg.type === "response.function_call_arguments.done") {
+        fastify.log.info(`Tool call: ${msg.name}`);
         await handleToolCall(
           msg.name,
           JSON.parse(msg.arguments || "{}"),
@@ -155,7 +165,7 @@ fastify.register(async (fastify) => {
 
       if (msg.event === "start") {
         streamSid = msg.start.streamSid;
-        fastify.log.info(`Stream started: ${streamSid} for lead: ${leadId}`);
+        fastify.log.info(`Twilio stream started: ${streamSid}`);
       }
 
       if (msg.event === "media") {
@@ -163,7 +173,6 @@ fastify.register(async (fastify) => {
           type: "input_audio_buffer.append",
           audio: msg.media.payload,
         });
-
         if (sessionReady && openAiWs.readyState === 1) {
           openAiWs.send(audioChunk);
         } else {
@@ -172,7 +181,7 @@ fastify.register(async (fastify) => {
       }
 
       if (msg.event === "stop") {
-        fastify.log.info(`Stream stopped for lead: ${leadId}`);
+        fastify.log.info(`Twilio stream stopped for lead: ${leadId}`);
         openAiWs.close();
       }
     });
@@ -181,21 +190,16 @@ fastify.register(async (fastify) => {
     openAiWs.on("close", () => {
       fastify.log.info(`OpenAI WS closed for lead: ${leadId}`);
       if (twilioWs.readyState === 1) twilioWs.close();
-
-      // Log call end to Base44
-      fetch(`${BASE44_URL}?action=voice_call_ended`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lead_id: leadId, call_sid: callSid }),
-      }).catch(() => {});
+      callBase44("voice_call_ended", { lead_id: leadId, call_sid: callSid }).catch(() => {});
     });
 
     twilioWs.on("close", () => {
+      fastify.log.info(`Twilio WS closed for lead: ${leadId}`);
       if (openAiWs.readyState === 1) openAiWs.close();
     });
 
-    openAiWs.on("error", (err) => fastify.log.error("OpenAI WS error:", err));
-    twilioWs.on("error", (err) => fastify.log.error("Twilio WS error:", err));
+    openAiWs.on("error", (err) => fastify.log.error("OpenAI WS error:", err.message));
+    twilioWs.on("error", (err) => fastify.log.error("Twilio WS error:", err.message));
   });
 });
 
@@ -311,24 +315,15 @@ async function handleToolCall(
   };
 
   if (name === "qualify_lead") {
-    await fetch(`${BASE44_URL}?action=qualify_lead_from_call`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ lead_id: leadId, ...args }),
-    }).catch(() => {});
+    await callBase44("qualify_lead_from_call", { lead_id: leadId, ...args }).catch(() => {});
     ack({ success: true });
   }
 
   if (name === "book_appointment") {
-    // Send Calendly link via SMS through Base44
-    await fetch(`${BASE44_URL}?action=send_calendly_sms`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        lead_id: leadId,
-        preferred_time: args.preferred_time || "",
-        calendly_link: calendlyLink,
-      }),
+    await callBase44("send_calendly_sms", {
+      lead_id: leadId,
+      preferred_time: args.preferred_time || "",
+      calendly_link: calendlyLink,
     }).catch(() => {});
     ack({
       success: true,
@@ -338,7 +333,6 @@ async function handleToolCall(
 
   if (name === "transfer_to_agent") {
     try {
-      // Inject warm transfer TwiML into the live call via Twilio REST
       const authHeader =
         "Basic " + Buffer.from(`${TWILIO_API_KEY_SID}:${TWILIO_API_KEY_SECRET}`).toString("base64");
       await fetch(
@@ -354,26 +348,17 @@ async function handleToolCall(
           }),
         }
       );
-      // Log transfer to Base44
-      await fetch(`${BASE44_URL}?action=log_transfer`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lead_id: leadId, reason: args.reason }),
-      }).catch(() => {});
+      await callBase44("log_transfer", { lead_id: leadId, reason: args.reason }).catch(() => {});
       ack({ success: true });
     } catch (err) {
+      fastify.log.error("Transfer failed:", err.message);
       ack({ success: false, error: err.message });
     }
   }
 
   if (name === "end_call") {
-    await fetch(`${BASE44_URL}?action=close_call`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ lead_id: leadId, reason: args.reason }),
-    }).catch(() => {});
+    await callBase44("close_call", { lead_id: leadId, reason: args.reason }).catch(() => {});
     ack({ success: true });
-    // Hang up after a short delay so AI can say goodbye
     setTimeout(() => {
       if (twilioWs.readyState === 1) twilioWs.close();
     }, 4000);
