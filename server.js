@@ -14,7 +14,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2";
 const OPENAI_REALTIME_VOICE =
-  process.env.OPENAI_REALTIME_VOICE || "verse";
+  process.env.OPENAI_REALTIME_VOICE || "coral";
 
 const BASE44_URL = process.env.BASE44_FUNCTION_URL;
 const BASE44_API_KEY = process.env.BASE44_API_KEY;
