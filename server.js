@@ -232,8 +232,9 @@ fastify.register(async (fastify) => {
         safeSend(openAiWs, {
           type: "session.update",
           session: {
+            type: "realtime",
             model: OPENAI_REALTIME_MODEL,
-            instructions: systemPrompt,
+           instructions: systemPrompt,
 
             modalities: ["text", "audio"],
             voice: OPENAI_REALTIME_VOICE,
