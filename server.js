@@ -15,6 +15,7 @@
 
 import Fastify from "fastify";
 import FastifyWS from "@fastify/websocket";
+import { WebSocket } from "ws";
 
 const fastify = Fastify({ logger: true });
 fastify.register(FastifyWS);
