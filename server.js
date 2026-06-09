@@ -41,10 +41,19 @@ fastify.get("/", async () => ({ status: "CRX.OS Voice Bridge running" }));
 
 // ─── WebSocket: Media Stream Bridge ──────────────────────────────────────────
 fastify.register(async (fastify) => {
-  fastify.get("/media-stream", { websocket: true }, async (twilioWs, req) => {
-    const url = new URL(req.url, "http://localhost");
-    const leadId = url.searchParams.get("lead_id");
-    const callSid = url.searchParams.get("call_sid");
+  fastify.get("/media-stream", { websocket: true }, async (connection, request) => {
+  const leadId = request.query.lead_id || null;
+  const callSid = request.query.call_sid || "";
+
+  fastify.log.info(`WebSocket connected — lead_id: ${leadId}, call_sid: ${callSid}`);
+
+  if (!leadId) {
+    fastify.log.error("No lead_id — closing");
+    connection.socket.close();
+    return;
+  }
+
+  const twilioWs = connection.socket;
 
     // Fetch lead + realtor profile from Base44
     let lead = null;
