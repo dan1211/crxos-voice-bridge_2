@@ -144,13 +144,14 @@ fastify.register(async (fastify) => {
         // Open OpenAI Realtime session
         fastify.log.info(`Opening OpenAI WS — API key starts with: ${OPENAI_API_KEY?.substring(0, 8)}`);
         openAiWs = new WebSocket(
-          "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
-          [
-            "realtime",
-            `openai-insecure-api-key.${OPENAI_API_KEY}`,
-            "openai-beta.realtime-v1",
-          ]
-        );
+  "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+  {
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1",
+    },
+  }
+);
 
         openAiWs.on("open", () => {
           fastify.log.info("OpenAI Realtime WS opened");
